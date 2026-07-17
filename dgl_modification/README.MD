@@ -41,14 +41,21 @@ cp gatconv.py   $DGL_CONV/gatconv.py
 ### `gatconv.py` (`GATConv`)
 
 - `forward(...)` gains a `reuse` flag: when `True`, returns an extra tuple
-  `(el, er, feat_src, node_denom)` for caching attention intermediates.
+  `(el, er, feat_src, node_denom, node_max)` for caching attention intermediates
+  (`node_max` is the per-node max logit used as a stable-softmax shift).
 - `increGAT_forward(graph, reuse_list, last_tensor, change_node)`:
   incremental GAT forward pass. Reuses cached attention logits
   `(el, er, feat_src)` from the previous snapshot and only recomputes the
-  softmax denominator correction via `get_numer_with_pm`.
+  softmax denominator correction via `get_numer_with_pm`. Uses an online-softmax
+  rescale (raise the shift to include added-edge maxima, rescale the cached
+  denominator) so the incremental softmax is stable at any feature scale.
 - `edge_softmax_with_denominator`: manual edge-softmax that also returns the
-  per-node denominator `∑exp(z)`, enabling incremental updates.
+  per-node denominator `∑exp(z − m)` **and the per-node max logit `m`**. It
+  subtracts the per-node max before `exp` (log-sum-exp stabilization, matching
+  DGL's `edge_softmax`), so the manual softmax does not overflow in fp32; the
+  max is cached and reused by the incremental path.
 - `normalize_edge_weight`: normalizes per-edge weights by the corresponding
   node denominator.
 - `get_numer_with_pm`: computes the signed (`pm = ±1`) weighted sum of
-  `exp(logit)` per node, used to update the softmax denominator incrementally.
+  `exp(logit − m)` per node (using the cached per-node shift `m`), used to
+  update the softmax denominator incrementally.

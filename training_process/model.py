@@ -58,10 +58,15 @@ class IntraReuseConv(nn.Module):
 
     def __init__(self, in_feats, hidden_size):
         super().__init__()
+        # activation=None: the reuse path caches/increments the PRE-activation
+        # symmetric-norm aggregation (so the additive/rescale IncreConv identity
+        # holds); ReLU is applied after the transformation (see
+        # _project_with_unique_gemm / the pipeline), identically for every
+        # snapshot in the group.
         self.gcn = GraphConv(
             in_feats, hidden_size,
-            activation=F.relu,
-            norm='none', bias=False, weight=False,
+            activation=None,
+            norm='both', bias=False, weight=False,
             reuse=True,
             allow_zero_in_degree=True,
         )
@@ -90,10 +95,13 @@ class IntraReuseGAT(nn.Module):
 
     def __init__(self, in_feats, hidden_size, num_heads):
         super().__init__()
+        # activation=None: cache/increment the PRE-activation aggregation so the
+        # softmax-denominator rescale identity holds; ReLU is applied uniformly
+        # in GATLSTM._temporal before the RNN.
         self.gat = GATConv(
             in_feats, hidden_size,
             num_heads=num_heads,
-            activation=F.relu,
+            activation=None,
             bias=False,
             residual=False,
             allow_zero_in_degree=True,
@@ -125,14 +133,15 @@ def _project_with_unique_gemm(rgcn, aggregations, changed_nodes):
     """
     MatMul reuse stage: project the base snapshot in full, but project only
     the changed-node rows for subsequent snapshots. Reconstruct the full
-    per-snapshot outputs by cloning and scattering.
+    per-snapshot outputs by cloning and scattering. ReLU is applied here (on
+    the aggregation) so every snapshot receives the same nonlinearity.
     """
     shape_list = [aggregations[0].shape[0]]
-    unique_feat = aggregations[0]
+    unique_feat = F.relu(aggregations[0])
     for i in range(1, len(aggregations)):
         changed = changed_nodes[i - 1]
         shape_list.append(len(changed))
-        unique_feat = torch.cat((unique_feat, aggregations[i][changed]), dim=0)
+        unique_feat = torch.cat((unique_feat, F.relu(aggregations[i][changed])), dim=0)
     unique_out = rgcn.unique_gemm(unique_feat)
 
     outs = [unique_out[:shape_list[0]]]
@@ -147,121 +156,224 @@ def _project_with_unique_gemm(rgcn, aggregations, changed_nodes):
 
 # =============================================================================
 # Triple-stream pipelines.
+#
+# A single unified pipeline per model family handles Type-I (intra) reuse, the
+# HtoD/Conv/MatMul overlap, and -- when a `cached` prefix of aggregations from
+# the previous group is supplied -- Type-II (inter) reuse, so all three compose
+# in one code path.
+#
+# Graphs must arrive ON CPU (pinned): the copy stream performs the actual HtoD,
+# overlapping it with Conv/MatMul. CUDA streams are created once and reused
+# across iterations via _get_streams (avoids per-call stream construction).
 # =============================================================================
 
-def triple_stream_pipeline_gcn(rgcn, g_list, changed_nodes, feat, rank):
-    """
-    Triple-stream pipeline for GCN-based models.
+_STREAM_POOL = {}
 
-    Streams:
-        copy_stream  -- PCIe bandwidth (HtoD)
-        conv_stream  -- HBM bandwidth (GraphConv / IncreConv)
-        gemm_stream  -- Compute (dense MatMul)
-    Dependency: HtoD(i) -> Conv(i) -> MatMul(i).
-    HtoD(i+1) and Conv(i) overlap; Conv(i) and MatMul(i-1) overlap.
-    """
-    copy_stream = torch.cuda.Stream(priority=0)
-    conv_stream = torch.cuda.Stream(priority=0)
-    gemm_stream = torch.cuda.Stream(priority=-1)
 
+def _get_streams(device):
+    """Return persistent (copy, conv, gemm) CUDA streams for ``device``.
+
+    Streams are created once per device and reused across every pipeline call,
+    rather than reconstructed each iteration.
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    key = (dev.type, dev.index)
+    pool = _STREAM_POOL.get(key)
+    if pool is None:
+        pool = (
+            torch.cuda.Stream(device=dev),            # copy  (HtoD)
+            torch.cuda.Stream(device=dev),            # conv  (GraphConv / IncreConv)
+            torch.cuda.Stream(device=dev, priority=-1),  # gemm (dense MatMul)
+        )
+        _STREAM_POOL[key] = pool
+    return pool
+
+
+def _to_device_async(g, rank, copy_stream):
+    """Pinned, non-blocking HtoD of a CPU graph on the copy stream; returns the
+    device graph and an event recorded after the transfer. Graphs are loaded
+    once and reused across epochs, so pinning is guarded to a no-op if already
+    pinned."""
     with torch.cuda.stream(copy_stream):
-        g_dev = g_list[0].pin_memory_().to(rank, non_blocking=True)
-        copy_done = [torch.cuda.Event()]
-        copy_done[0].record(copy_stream)
+        if not g.is_pinned():
+            g.pin_memory_()
+        g_dev = g.to(rank, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(copy_stream)
+    return g_dev, ev
 
-    conv_done = []
-    conv_out_buf = []
-    gemm_inputs = []
-    gemm_out_buf = []
-    g_next_dev = None
 
-    for i in range(len(g_list)):
-        # (i+1)'th HtoD overlaps with Conv(i).
-        if i + 1 < len(g_list):
-            with torch.cuda.stream(copy_stream):
-                g_next_dev = g_list[i + 1].pin_memory_().to(rank, non_blocking=True)
-                ev_cp = torch.cuda.Event()
-                ev_cp.record(copy_stream)
-                copy_done.append(ev_cp)
+def _pipeline_gcn(rgcn, g_list, changed_nodes, feat, rank,
+                  cached=None, save_idx=None):
+    """
+    Triple-stream GCN pipeline with Type-I (intra) reuse and, when ``cached`` is
+    given, Type-II (inter) reuse.
 
-        conv_stream.wait_event(copy_done[i])
-        with torch.cuda.stream(conv_stream):
-            if i == 0:
-                conv_out = rgcn(g_dev, feat)
-                gemm_inputs.append(conv_out)
-            else:
-                conv_out = rgcn.incre_aggregate(feat, conv_out_buf[-1], g_dev)
-                gemm_inputs.append(conv_out[changed_nodes[i - 1]])
-            conv_out_buf.append(conv_out)
-            ev_conv = torch.cuda.Event()
-            ev_conv.record(conv_stream)
-            conv_done.append(ev_conv)
+    Args:
+        g_list:   snapshot group ON CPU (base snapshot + DiffMaps).
+        cached:   ``{position: pre-activation aggregation}`` for overlap
+                  snapshots reused from the previous group; their HtoD + Conv
+                  are skipped (Type-II).
+        save_idx: positions whose pre-activation aggregation to return for the
+                  next group.
 
-        if i > 0:
-            gemm_stream.wait_event(conv_done[i - 1])
-            with torch.cuda.stream(gemm_stream):
-                gemm_out_buf.append(rgcn.unique_gemm(gemm_inputs[i - 1]))
+    Dependency per snapshot i: HtoD(i) -> Conv(i) -> MatMul(i); ReLU+MatMul run
+    on the gemm stream so Conv(i+1) overlaps MatMul(i) and HtoD(i+2).
 
-        if i + 1 < len(g_list):
-            g_dev = g_next_dev
+    Returns ``(outs, saved)``.
+    """
+    cached = cached or {}
+    save_set = set(save_idx or [])
+    copy_stream, conv_stream, gemm_stream = _get_streams(rank)
+    n = len(g_list)
 
-    gemm_stream.wait_event(conv_done[-1])
-    with torch.cuda.stream(gemm_stream):
-        gemm_out_buf.append(rgcn.unique_gemm(gemm_inputs[-1]))
-    torch.cuda.synchronize()
+    conv_out_buf = [None] * n     # pre-activation aggregations (chaining + save)
+    gemm_out_buf = [None] * n
+    copy_done = {}
+    conv_done = {}
+    dev = {}
+
+    def prefetch(i):
+        if i in cached or i in dev:
+            return
+        dev[i], copy_done[i] = _to_device_async(g_list[i], rank, copy_stream)
+
+    prefetch(0)
+    for i in range(n):
+        if i + 1 < n:
+            prefetch(i + 1)
+
+        # ---- Conv (or reuse the cached aggregation) ----
+        if i in cached:
+            conv_out = cached[i]
+        else:
+            conv_stream.wait_event(copy_done[i])
+            with torch.cuda.stream(conv_stream):
+                if i == 0:
+                    conv_out = rgcn(dev[i], feat)
+                else:
+                    conv_out = rgcn.incre_aggregate(feat, conv_out_buf[i - 1], dev[i])
+                ev = torch.cuda.Event()
+                ev.record(conv_stream)
+                conv_done[i] = ev
+        conv_out_buf[i] = conv_out
+
+        # ---- ReLU + MatMul on the gemm stream (gated on Conv(i)) ----
+        if i in conv_done:
+            gemm_stream.wait_event(conv_done[i])
+        with torch.cuda.stream(gemm_stream):
+            gin = F.relu(conv_out) if i == 0 else F.relu(conv_out[changed_nodes[i - 1]])
+            gemm_out_buf[i] = rgcn.unique_gemm(gin)
+
+    # The gemm stream is the tail of the HtoD->Conv->MatMul chain; syncing it
+    # (rather than the whole device) makes every produced tensor safe to consume
+    # on the default stream below and by the next group.
+    gemm_stream.synchronize()
 
     outs = [gemm_out_buf[0]]
-    for i in range(1, len(g_list)):
+    for i in range(1, n):
         out = outs[-1].clone()
         out[changed_nodes[i - 1]] = gemm_out_buf[i]
         outs.append(out)
-    return outs
+
+    saved = [conv_out_buf[i] for i in sorted(save_set)] if save_set else []
+    return outs, saved
 
 
-def triple_stream_pipeline_gat(rgat, g_list, changed_nodes, feat, rank):
+def _pipeline_gat(rgat, g_list, changed_nodes, feat, rank,
+                  cached=None, save_idx=None):
     """
-    Triple-stream pipeline for GAT.
+    Two-stream GAT pipeline (HtoD overlaps Conv; MatMul is cached inside the
+    first full GAT call) with Type-I and optional Type-II reuse.
 
-    In GAT the transformation (Wh_i) precedes aggregation, and within a group
-    node features are time-invariant, so the transformation is computed once
-    and cached. The pipeline therefore overlaps HtoD with the (incremental)
-    Conv stream only; MatMul runs implicitly as part of the first GAT call.
-    Dependency: HtoD(i) -> Conv(i); Conv(i) consumes the cached MatMul.
+    ``cached`` maps ``{position: (out, reuse_cache)}`` for overlap snapshots:
+    both the aggregation output and the attention intermediates (el, er,
+    feat_src, node_denom) are reused, so the first non-overlap snapshot can be
+    computed *incrementally* (increGAT_forward) rather than via a full GAT
+    forward on a DiffMap. ``save_idx`` returns ``(out, reuse_cache)`` per
+    position.
     """
-    copy_stream = torch.cuda.Stream(priority=0)
-    conv_stream = torch.cuda.Stream(priority=0)
+    cached = cached or {}
+    save_set = set(save_idx or [])
+    copy_stream, conv_stream, _ = _get_streams(rank)
+    n = len(g_list)
 
-    with torch.cuda.stream(copy_stream):
-        g_dev = g_list[0].pin_memory_().to(rank, non_blocking=True)
-        copy_done = [torch.cuda.Event()]
-        copy_done[0].record(copy_stream)
-
-    conv_out_buf = []
+    outs = [None] * n
+    caches = [None] * n
+    copy_done = {}
+    dev = {}
     reuse_cache = None
-    g_next_dev = None
 
-    for i in range(len(g_list)):
-        if i + 1 < len(g_list):
-            with torch.cuda.stream(copy_stream):
-                g_next_dev = g_list[i + 1].pin_memory_().to(rank, non_blocking=True)
-                ev_cp = torch.cuda.Event()
-                ev_cp.record(copy_stream)
-                copy_done.append(ev_cp)
+    def prefetch(i):
+        if i in cached or i in dev:
+            return
+        dev[i], copy_done[i] = _to_device_async(g_list[i], rank, copy_stream)
 
-        conv_stream.wait_event(copy_done[i])
-        with torch.cuda.stream(conv_stream):
-            if i == 0:
-                out, reuse_cache = rgat(g_dev, feat)
-            else:
-                out = rgat.incre_forward(
-                    g_dev, reuse_cache, conv_out_buf[-1], changed_nodes[i - 1])
-            conv_out_buf.append(out)
+    prefetch(0)
+    for i in range(n):
+        if i + 1 < n:
+            prefetch(i + 1)
 
-        if i + 1 < len(g_list):
-            g_dev = g_next_dev
+        if i in cached:
+            out, reuse_cache = cached[i]
+        else:
+            conv_stream.wait_event(copy_done[i])
+            with torch.cuda.stream(conv_stream):
+                if reuse_cache is None:
+                    # First materialized snapshot: full GAT forward on the full
+                    # base graph (also produces the reusable attention cache).
+                    out, reuse_cache = rgat(dev[i], feat)
+                else:
+                    out, reuse_cache = rgat.incre_forward(
+                        dev[i], reuse_cache, outs[i - 1], changed_nodes=None)
+        outs[i] = out
+        caches[i] = reuse_cache
 
-    torch.cuda.synchronize()
-    return conv_out_buf
+    conv_stream.synchronize()
+    saved = [(outs[i], caches[i]) for i in sorted(save_set)] if save_set else []
+    return outs, saved
+
+
+def _pipeline_evolve_aggregate(rgcn, g_list, feat, rank,
+                               cached=None, save_idx=None):
+    """
+    HtoD/Conv pipeline that produces the per-snapshot pre-activation
+    aggregations for EvolveGCN (whose per-snapshot evolved-weight MatMul cannot
+    be fused into ``unique_gemm``). Supports Type-II ``cached`` prefix and
+    ``save_idx`` like the other pipelines.
+    """
+    cached = cached or {}
+    save_set = set(save_idx or [])
+    copy_stream, conv_stream, _ = _get_streams(rank)
+    n = len(g_list)
+
+    aggregations = [None] * n
+    copy_done = {}
+    dev = {}
+
+    def prefetch(i):
+        if i in cached or i in dev:
+            return
+        dev[i], copy_done[i] = _to_device_async(g_list[i], rank, copy_stream)
+
+    prefetch(0)
+    for i in range(n):
+        if i + 1 < n:
+            prefetch(i + 1)
+        if i in cached:
+            aggregations[i] = cached[i]
+        else:
+            conv_stream.wait_event(copy_done[i])
+            with torch.cuda.stream(conv_stream):
+                if i == 0:
+                    aggregations[i] = rgcn(dev[i], feat)
+                else:
+                    aggregations[i] = rgcn.incre_aggregate(
+                        feat, aggregations[i - 1], dev[i])
+
+    conv_stream.synchronize()
+    saved = [aggregations[i] for i in sorted(save_set)] if save_set else []
+    return aggregations, saved
 
 
 # =============================================================================
@@ -308,33 +420,44 @@ class _GCNReuseMixin:
         return self._temporal(outs)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
-        outs = triple_stream_pipeline_gcn(
-            self.rgcn, g_list, changed_nodes, feat, rank)
+        outs, _ = _pipeline_gcn(self.rgcn, g_list, changed_nodes, feat, rank)
         return self._temporal(outs)
 
-    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx):
-        aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
-        cached = [aggregations[i] for i in inter_reuse_idx]
-        outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
-        return self._temporal(outs), cached
+    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx,
+                           rank=None, use_3stream=False):
+        """First group of a paired slot: compute it (Type-I) and return the
+        overlap aggregations for the second group (Type-II). With use_3stream
+        the triple-stream pipeline is used, so Type-I + Type-II + 3-stream
+        compose in one path."""
+        if use_3stream:
+            outs, saved = _pipeline_gcn(self.rgcn, g_list, changed_nodes, feat,
+                                        rank, save_idx=inter_reuse_idx)
+        else:
+            aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
+            saved = [aggregations[i] for i in sorted(inter_reuse_idx)]
+            outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
+        return self._temporal(outs), saved
 
-    def forward_inter_apply(self, g_list, feat, changed_nodes,
-                            inter_reuse_idx, cached_aggregations):
+    def forward_inter_apply(self, g_list, feat, changed_nodes, inter_reuse_idx,
+                            cached_aggregations, rank=None, use_3stream=False):
+        """Second group: reuse the first group's overlap aggregations (Type-II)
+        for the shared prefix; compute the rest incrementally."""
         if not inter_reuse_idx:
+            if use_3stream:
+                return self.forward_intra_3stream(g_list, changed_nodes, feat, rank)
             return self.forward_intra(g_list, changed_nodes, feat)
-        # Aggregations: pull cached entries at overlap positions; compute the
-        # rest via IncreConv on the non-overlapping snapshots.
+        cached = dict(zip(sorted(inter_reuse_idx), cached_aggregations))
+        if use_3stream:
+            outs, _ = _pipeline_gcn(self.rgcn, g_list, changed_nodes, feat, rank,
+                                    cached=cached)
+            return self._temporal(outs)
         aggregations = [None] * len(g_list)
-        cached_iter = iter(cached_aggregations)
         for i in range(len(g_list)):
-            if i in inter_reuse_idx:
-                aggregations[i] = next(cached_iter)
-                continue
-            if i == 0:
+            if i in cached:
+                aggregations[i] = cached[i]
+            elif i == 0:
                 aggregations[i] = self.rgcn(g_list[i], feat)
             else:
-                # Fall back to the previous aggregation (whether cached or
-                # freshly computed) as the base for IncreConv.
                 aggregations[i] = self.rgcn.incre_aggregate(
                     feat, aggregations[i - 1], g_list[i])
         outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
@@ -439,7 +562,7 @@ class EvolveGCN(nn.Module):
         gemm_out = None
         for agg in aggregations:
             W = self.matgru(W)
-            gemm_out = torch.matmul(agg, W)
+            gemm_out = torch.matmul(F.relu(agg), W)
         return self.mlp(gemm_out)
 
     def forward_intra(self, g_list, changed_nodes, feat):
@@ -447,64 +570,41 @@ class EvolveGCN(nn.Module):
         return self._evolve_and_project(aggregations)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
-        # The Conv stream handles IncreConv; the evolved-weight MatMul
-        # cannot be fused into unique_gemm. For pipelining we reuse the GCN
-        # pipeline helper to produce aggregations, then apply evolution
-        # serially at the end.
-        # To keep the pipeline meaningful we stream HtoD + Conv and collect
-        # the per-snapshot aggregations directly.
-        copy_stream = torch.cuda.Stream(priority=0)
-        conv_stream = torch.cuda.Stream(priority=0)
-
-        with torch.cuda.stream(copy_stream):
-            g_dev = g_list[0].pin_memory_().to(rank, non_blocking=True)
-            copy_done = [torch.cuda.Event()]
-            copy_done[0].record(copy_stream)
-
-        aggregations = []
-        g_next_dev = None
-        for i in range(len(g_list)):
-            if i + 1 < len(g_list):
-                with torch.cuda.stream(copy_stream):
-                    g_next_dev = g_list[i + 1].pin_memory_().to(rank, non_blocking=True)
-                    ev_cp = torch.cuda.Event()
-                    ev_cp.record(copy_stream)
-                    copy_done.append(ev_cp)
-
-            conv_stream.wait_event(copy_done[i])
-            with torch.cuda.stream(conv_stream):
-                if i == 0:
-                    aggregations.append(self.rgcn(g_dev, feat))
-                else:
-                    aggregations.append(self.rgcn.incre_aggregate(
-                        feat, aggregations[-1], g_dev))
-
-            if i + 1 < len(g_list):
-                g_dev = g_next_dev
-
-        torch.cuda.synchronize()
+        aggregations, _ = _pipeline_evolve_aggregate(
+            self.rgcn, g_list, feat, rank)
         return self._evolve_and_project(aggregations)
 
-    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx):
-        aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
-        cached = [aggregations[i] for i in inter_reuse_idx]
-        return self._evolve_and_project(aggregations), cached
+    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx,
+                           rank=None, use_3stream=False):
+        if use_3stream:
+            aggregations, saved = _pipeline_evolve_aggregate(
+                self.rgcn, g_list, feat, rank, save_idx=inter_reuse_idx)
+        else:
+            aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
+            saved = [aggregations[i] for i in sorted(inter_reuse_idx)]
+        return self._evolve_and_project(aggregations), saved
 
     def forward_inter_apply(self, g_list, feat, changed_nodes,
-                            inter_reuse_idx, cached_aggregations):
+                            inter_reuse_idx, cached_aggregations,
+                            rank=None, use_3stream=False):
         if not inter_reuse_idx:
+            if use_3stream:
+                return self.forward_intra_3stream(g_list, changed_nodes, feat, rank)
             return self.forward_intra(g_list, changed_nodes, feat)
-        aggregations = [None] * len(g_list)
-        cached_iter = iter(cached_aggregations)
-        for i in range(len(g_list)):
-            if i in inter_reuse_idx:
-                aggregations[i] = next(cached_iter)
-                continue
-            if i == 0:
-                aggregations[i] = self.rgcn(g_list[i], feat)
-            else:
-                aggregations[i] = self.rgcn.incre_aggregate(
-                    feat, aggregations[i - 1], g_list[i])
+        cached = dict(zip(sorted(inter_reuse_idx), cached_aggregations))
+        if use_3stream:
+            aggregations, _ = _pipeline_evolve_aggregate(
+                self.rgcn, g_list, feat, rank, cached=cached)
+        else:
+            aggregations = [None] * len(g_list)
+            for i in range(len(g_list)):
+                if i in cached:
+                    aggregations[i] = cached[i]
+                elif i == 0:
+                    aggregations[i] = self.rgcn(g_list[i], feat)
+                else:
+                    aggregations[i] = self.rgcn.incre_aggregate(
+                        feat, aggregations[i - 1], g_list[i])
         return self._evolve_and_project(aggregations)
 
 
@@ -524,59 +624,74 @@ class GATLSTM(nn.Module):
     # --- temporal ---------------------------------------------------------
 
     def _temporal(self, per_snapshot_feats):
-        flat = [h.flatten(1) for h in per_snapshot_feats]
+        flat = [F.relu(h).flatten(1) for h in per_snapshot_feats]
         last, _ = _rnn_last_step(self._rnn, flat)
         return self.fc(last)
 
     # --- intra ------------------------------------------------------------
 
     def _aggregate_group_gat(self, g_list, feat):
-        """Run the GAT stage with Type-I reuse on a snapshot group."""
+        """Run the GAT stage with Type-I reuse; returns per-snapshot outputs and
+        per-snapshot reuse caches (attention intermediates el/er/feat_src/denom)."""
         outs = []
+        caches = []
         reuse_cache = None
         for i, g in enumerate(g_list):
             if i == 0:
                 out, reuse_cache = self.rgat(g, feat)
             else:
-                # The changed-node set is needed by increGAT_forward so that
-                # only touched rows consume fresh attention-weighted messages
-                # and unchanged rows are carried over from the cache.
-                out = self.rgat.incre_forward(
+                out, reuse_cache = self.rgat.incre_forward(
                     g, reuse_cache, outs[-1], changed_nodes=None)
             outs.append(out)
-        return outs, reuse_cache
+            caches.append(reuse_cache)
+        return outs, caches
 
     def forward_intra(self, g_list, changed_nodes, feat):
         outs, _ = self._aggregate_group_gat(g_list, feat)
         return self._temporal(outs)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
-        outs = triple_stream_pipeline_gat(
-            self.rgat, g_list, changed_nodes, feat, rank)
+        outs, _ = _pipeline_gat(self.rgat, g_list, changed_nodes, feat, rank)
         return self._temporal(outs)
 
     # --- inter ------------------------------------------------------------
 
-    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx):
-        outs, _ = self._aggregate_group_gat(g_list, feat)
-        cached = [outs[i].clone().detach() for i in inter_reuse_idx]
-        return self._temporal(outs), cached
+    def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx,
+                           rank=None, use_3stream=False):
+        if use_3stream:
+            outs, saved = _pipeline_gat(self.rgat, g_list, changed_nodes, feat,
+                                        rank, save_idx=inter_reuse_idx)
+        else:
+            outs, caches = self._aggregate_group_gat(g_list, feat)
+            # Cache both the output and the attention intermediates so the next
+            # group can continue INCREMENTALLY from the overlap prefix.
+            saved = [(outs[i], caches[i]) for i in sorted(inter_reuse_idx)]
+        return self._temporal(outs), saved
 
-    def forward_inter_apply(self, g_list, feat, changed_nodes,
-                            inter_reuse_idx, cached_outs):
+    def forward_inter_apply(self, g_list, feat, changed_nodes, inter_reuse_idx,
+                            cached, rank=None, use_3stream=False):
         if not inter_reuse_idx:
+            if use_3stream:
+                return self.forward_intra_3stream(g_list, changed_nodes, feat, rank)
             return self.forward_intra(g_list, changed_nodes, feat)
-        outs = []
+        cached_map = dict(zip(sorted(inter_reuse_idx), cached))
+        if use_3stream:
+            outs, _ = _pipeline_gat(self.rgat, g_list, changed_nodes, feat, rank,
+                                    cached=cached_map)
+            return self._temporal(outs)
+        # Sequential (no 3-stream): reuse (out, reuse_cache) over the overlap
+        # prefix, then continue incrementally over the suffix. This uses the
+        # cached attention intermediates so the first suffix snapshot is an
+        # incremental update rather than a (wrong) full forward on a DiffMap.
+        outs = [None] * len(g_list)
         reuse_cache = None
-        cached_iter = iter(cached_outs)
-        for i, g in enumerate(g_list):
-            if i in inter_reuse_idx:
-                outs.append(next(cached_iter).clone())
-                continue
-            if i == 0 or reuse_cache is None:
-                out, reuse_cache = self.rgat(g, feat)
+        for i in range(len(g_list)):
+            if i in cached_map:
+                out, reuse_cache = cached_map[i]
+            elif reuse_cache is None:
+                out, reuse_cache = self.rgat(g_list[i], feat)
             else:
-                out = self.rgat.incre_forward(
-                    g, reuse_cache, outs[-1], changed_nodes=None)
-            outs.append(out)
+                out, reuse_cache = self.rgat.incre_forward(
+                    g_list[i], reuse_cache, outs[i - 1], changed_nodes=None)
+            outs[i] = out
         return self._temporal(outs)

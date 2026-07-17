@@ -27,7 +27,7 @@ def mycallback(model, where):
 
 
 # =============================================================================
-# ILP with reuse -- matches tex/Linear_Programming.tex exactly.
+# ILP with reuse -- epigraph min-max linearization (Method-v5.tex Sec. 5.2).
 # =============================================================================
 def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
                              L=2, alpha=0.0, ideal_gap=0.02):
@@ -54,7 +54,7 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
     model.setParam("Symmetry", 0)
 
     max_iter_n = (snapshot_n + gpu_n - 1) // gpu_n   # m = ceil(n / G)
-    sum_t = sum(time_costs)                           # big-M value
+    sum_t = sum(time_costs)                           # upper bound on per-GPU load / makespan (variable bounds)
 
     # -------------------------------------------------------------------------
     # Decision variables
@@ -74,18 +74,17 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
                     y[k1, k2, i, j] = model.addVar(
                         vtype=GRB.BINARY, name=f"y_{k1}_{k2}_{i}_{j}")
 
-    # Per-GPU effective time t_gpu_{i,j} (paper Eq. z-def; renamed here to
-    # disambiguate from the running-max variable z below).
+    # Per-GPU effective time (load) t_gpu_{i,j} = base cost - reuse benefit
+    # (paper Eq. L_i_j).
     t_gpu = [[model.addVar(lb=-sum_t, ub=sum_t, vtype=GRB.CONTINUOUS,
                            name=f"t_gpu_{i}_{j}")
               for j in range(gpu_n)]
              for i in range(max_iter_n)]
 
-    # Running-max z_{i,j}: z_{i,G} = max_j t_gpu_{i,j}
-    # (paper Eq. max-constr-1..4)
-    z = [[model.addVar(lb=0, ub=sum_t, vtype=GRB.CONTINUOUS,
-                       name=f"z_{i}_{j}")
-          for j in range(gpu_n)]
+    # Per-iteration makespan T_i (epigraph variable, paper Eq. minmax_constraint).
+    # Minimizing sum_i T_i drives each T_i to max_j t_gpu_{i,j} + alpha with no
+    # Big-M and no auxiliary binaries.
+    T = [model.addVar(lb=0, ub=sum_t + alpha, vtype=GRB.CONTINUOUS, name=f"T_{i}")
          for i in range(max_iter_n)]
 
     # -------------------------------------------------------------------------
@@ -138,40 +137,22 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
                 name=f"def_t_gpu_{i}_{j}")
 
     # -------------------------------------------------------------------------
-    # Big-M linearization of z_{i,j} = max_{1<=j'<=j} t_gpu_{i,j'}
-    # Paper Eq. max-constr-1..4:
-    #   (1) z_{i,j}   >= z_{i,j-1}                   forall j >= 2
-    #   (2) z_{i,j}   >= t_gpu_{i,j}                 forall j
-    #   (3) z_{i,j}   <= z_{i,j-1} + M (1 - u_{i,j}) forall j >= 2
-    #   (4) z_{i,j}   <= t_gpu_{i,j} + M u_{i,j}     forall j
-    #
-    # For j = 1, only (2) and (4) apply. Since the objective minimizes z and
-    # u is free, the optimum forces u_{i,1} = 0 so z_{i,1} = t_gpu_{i,1}.
-    # We impose that equality explicitly for cleanliness.
+    # Min-max via epigraph (paper Eq. minmax_constraint):
+    #   T_i >= t_gpu_{i,j} + alpha,   forall j
+    # Because the objective minimizes sum_i T_i, each T_i is tightened to
+    # max_j t_gpu_{i,j} + alpha automatically -- no Big-M, no auxiliary binaries.
+    # This is the tightened LP relaxation the paper argues for.
     # -------------------------------------------------------------------------
-    M = sum_t
     for i in range(max_iter_n):
-        # j = 0 (paper's j = 1): z_{i,1} = t_gpu_{i,1}
-        model.addConstr(z[i][0] == t_gpu[i][0], name=f"z_init_{i}")
-
-        for j in range(1, gpu_n):
-            u = model.addVar(vtype=GRB.BINARY, name=f"u_{i}_{j}")
-            model.addConstr(z[i][j] >= z[i][j - 1],
-                            name=f"z_ge_prev_{i}_{j}")       # (1)
-            model.addConstr(z[i][j] >= t_gpu[i][j],
-                            name=f"z_ge_tgpu_{i}_{j}")       # (2)
-            model.addConstr(z[i][j] <= z[i][j - 1] + M * (1 - u),
-                            name=f"z_le_prev_bigM_{i}_{j}")  # (3)
-            model.addConstr(z[i][j] <= t_gpu[i][j] + M * u,
-                            name=f"z_le_tgpu_bigM_{i}_{j}")  # (4)
+        for j in range(gpu_n):
+            model.addConstr(T[i] >= t_gpu[i][j] + alpha,
+                            name=f"epigraph_{i}_{j}")
 
     # -------------------------------------------------------------------------
-    # Objective (paper Eq. obj): T = sum_i ( z_{i,G} + alpha )
-    #                            = sum_i z_{i,G} + m * alpha
+    # Objective (paper Eq. obj): T = sum_i T_i  (each T_i already includes alpha)
     # -------------------------------------------------------------------------
     model.setObjective(
-        quicksum(z[i][gpu_n - 1] for i in range(max_iter_n))
-        + max_iter_n * alpha,
+        quicksum(T[i] for i in range(max_iter_n)),
         GRB.MINIMIZE)
 
     print('Running optimizer (with reuse)...')
@@ -205,10 +186,10 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
         print('Imbalance ratio:', max(imbalance) / min(imbalance))
     print('Assignment:', assign_list)
     print(f'Objective T = {model.ObjVal:.2f}'
-          f' (= sum z_iG + m*alpha,  m={max_iter_n}, alpha={alpha})')
+          f' (= sum_i T_i,  m={max_iter_n}, alpha={alpha})')
     print(f'Runtime = {model.Runtime:.2f}s')
 
-    return model
+    return model, assign_list
 
 
 
@@ -218,6 +199,6 @@ if __name__ == "__main__":
 
     time_costs, reuse = read_from_file('YOUR_REUSE_LOG_FILENAME.txt')
 
-    test_snapshots = len(time_costs) - 1
+    test_snapshots = len(time_costs)
     get_snapshot_alloc_reuse(test_snapshots, test_gpus, time_costs, reuse,
                              L=2, alpha=alpha, ideal_gap=0.05)

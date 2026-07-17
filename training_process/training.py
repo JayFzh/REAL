@@ -65,24 +65,56 @@ def _build_model(model_name, dataset, hidden_size, rank):
     else:
         raise ValueError(f"unknown model: {model_name}")
     model = model.to(rank)
-    return nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+    # The model exposes several forward entry points (forward_intra,
+    # forward_intra_3stream, forward_inter_save/apply) and is driven via
+    # model.<method>(...), which would bypass DDP's single-forward automatic
+    # gradient reduction. We therefore keep a plain module, broadcast the
+    # initial parameters so every rank starts from identical weights, and
+    # synchronize gradients explicitly each step (see _allreduce_grads) --
+    # exactly the paper's gradient-AllReduce parameter synchronization.
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    return model
+
+
+def _allreduce_grads(model):
+    """AllReduce (average) gradients across all ranks before the optimizer step.
+
+    This is the explicit gradient synchronization the paper describes. It is
+    required because the model is called via ``model.<method>(...)`` rather than
+    through a DDP-wrapped ``forward``, so no automatic reduction happens.
+    """
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(world_size)
 
 
 def _run_singleton_slot(model, optimizer, g_list, changed_nodes, feat, label,
                         rank, use_3stream):
-    """Singleton slot: Type-I intra-group reuse (optionally triple-streamed)."""
-    g_list = [g.to(rank) for g in g_list]
+    """Singleton slot: Type-I intra-group reuse (optionally triple-streamed).
+
+    Gradients are AllReduced across ranks (via _allreduce_grads) before the
+    optimizer step, so the replicas stay synchronized -- the paper's
+    gradient-AllReduce parameter synchronization.
+    """
     optimizer.zero_grad()
-    with model.no_sync():
-        if use_3stream:
-            predictions = model.module.forward_intra_3stream(
-                g_list, changed_nodes, feat, rank)
-        else:
-            predictions = model.module.forward_intra(
-                g_list, changed_nodes, feat)
-        loss = F.cross_entropy(predictions, label)
-        loss.backward()
-        optimizer.step()
+    if use_3stream:
+        # Graphs stay on CPU; the triple-stream pipeline performs the HtoD on
+        # the copy stream, overlapping it with Conv/MatMul.
+        predictions = model.forward_intra_3stream(
+            g_list, changed_nodes, feat, rank)
+    else:
+        g_list = [g.to(rank) for g in g_list]
+        predictions = model.forward_intra(
+            g_list, changed_nodes, feat)
+    loss = F.cross_entropy(predictions, label)
+    loss.backward()
+    _allreduce_grads(model)
+    optimizer.step()
     return loss.item()
 
 
@@ -128,27 +160,44 @@ def _move_paired_groups_to_gpu(g_lists, inter_indices, rank):
 
 
 def _run_paired_slot(model, optimizer, g_lists, changed_nodes, inter_indices,
-                     feat, label, rank):
-    """Paired slot: Type-I + Type-II reuse via save/apply."""
-    gpu_lists = _move_paired_groups_to_gpu(g_lists, inter_indices, rank)
+                     feat, label, rank, use_3stream):
+    """Paired slot: Type-I + Type-II reuse via save/apply (with use_3stream, the
+    triple-stream pipeline runs on both groups, so intra + inter + 3-stream
+    compose).
 
-    # First group: save the aggregations at the overlap positions.
+    The two co-located groups form one K=2 mini-batch and receive a SINGLE
+    synchronized update: both forward passes run (the second reuses the first's
+    cached overlap aggregations), then one backward on the summed loss, one
+    gradient AllReduce, and one optimizer step -- matching the paper's
+    convergence model (batch enlarged by K=2 with one synchronized update).
+    """
+    if use_3stream:
+        # Groups stay on CPU; each group's pipeline performs its own HtoD and
+        # skips the cached overlap prefix (Type-II), so neither a pre-move nor
+        # graph sharing is needed.
+        g_a, g_b = g_lists[0], g_lists[1]
+    else:
+        gpu_lists = _move_paired_groups_to_gpu(g_lists, inter_indices, rank)
+        g_a, g_b = gpu_lists[0], gpu_lists[1]
+
     optimizer.zero_grad()
-    with model.no_sync():
-        predictions, saved = model.module.forward_inter_save(
-            gpu_lists[0], feat, changed_nodes[0], inter_indices[0])
-        loss_a = F.cross_entropy(predictions, label)
-        loss_a.backward(retain_graph=True)
-        optimizer.step()
-
-        # Second group: consume the saved aggregations.
-        optimizer.zero_grad()
-        predictions = model.module.forward_inter_apply(
-            gpu_lists[1], feat, changed_nodes[1], inter_indices[1], saved)
-        loss_b = F.cross_entropy(predictions, label)
-        loss_b.backward()
-        optimizer.step()
-    return loss_b.item()
+    # First group also caches the overlap aggregations for the second (Type-II).
+    predictions_a, saved = model.forward_inter_save(
+        g_a, feat, changed_nodes[0], inter_indices[0],
+        rank=rank, use_3stream=use_3stream)
+    # Second group consumes the saved aggregations. A single backward over the
+    # combined graph correctly accumulates gradients through the shared
+    # (attached) overlap aggregations for the GCN models and over the disjoint
+    # graphs for GAT.
+    predictions_b = model.forward_inter_apply(
+        g_b, feat, changed_nodes[1], inter_indices[1], saved,
+        rank=rank, use_3stream=use_3stream)
+    loss = (F.cross_entropy(predictions_a, label)
+            + F.cross_entropy(predictions_b, label))
+    loss.backward()
+    _allreduce_grads(model)
+    optimizer.step()
+    return loss.item()
 
 
 def train(rank, dataset, model_name, world_size, time_window_size, num_epochs,
@@ -186,7 +235,7 @@ def train(rank, dataset, model_name, world_size, time_window_size, num_epochs,
                 loss = _run_paired_slot(
                     model, optimizer,
                     g_lists, changed_node_list[it], inter_reuse_list[it],
-                    feat, label, rank)
+                    feat, label, rank, use_3stream=use_3stream)
                 tag = "paired"
             print(f"[rank {rank}] epoch={epoch} iter={it} ({tag}) "
                   f"loss={loss:.4f}")

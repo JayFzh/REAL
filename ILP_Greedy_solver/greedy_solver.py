@@ -85,8 +85,8 @@ def _find_closest_pair_reuse(lst, target, reuse, hash_table, indicator):
             closest_sum  -- reuse-adjusted sum for that pair
     """
     left, right = 0, len(lst) - 1
-    closest_sum = lst[left] + lst[right]
-    closest_pair = (lst[left], lst[right])
+    closest_pair = None
+    closest_sum = None
 
     while left < right:
         pair_idx = _find_indices([lst[left], lst[right]],
@@ -97,10 +97,13 @@ def _find_closest_pair_reuse(lst, target, reuse, hash_table, indicator):
         else:
             current_sum = lst[left] + lst[right]
 
-        diff_cur = abs(current_sum - target)
-        diff_best = abs(closest_sum - target)
-        if diff_cur < diff_best or (
-                diff_cur == diff_best and current_sum > closest_sum):
+        # Always record the reuse-adjusted sum of the chosen pair (the previous
+        # version seeded closest_sum with the UN-adjusted lst[left]+lst[right],
+        # so a returned pair could drop its reuse benefit from the load).
+        if (closest_pair is None
+                or abs(current_sum - target) < abs(closest_sum - target)
+                or (abs(current_sum - target) == abs(closest_sum - target)
+                    and current_sum > closest_sum)):
             closest_sum = current_sum
             closest_pair = (lst[left], lst[right])
 
@@ -144,7 +147,10 @@ def greedy(tasks, gpu_num, lat, reuse):
     cb_tasks = []
     cb_index = []
 
-    while len(tasks) >= gpu_num:
+    # Loop while a full D-slot iteration can still be formed from REAL groups.
+    # The `any(t != 0 ...)` guard stops once only the persistent zero sentinel
+    # remains (needed because the sentinel is never removed, e.g. for D == 1).
+    while len(tasks) >= gpu_num and any(t != 0 for t in tasks):
         n = len(tasks)
         largest = tasks[-1]
 
@@ -210,22 +216,28 @@ def greedy(tasks, gpu_num, lat, reuse):
             cb_index.append(_find_indices([pv[0], pv[1]], hash_table,
                                           indicator, consume=True))
 
-        # Remove the consumed values from `tasks` (by value).
-        tasks.remove(smaller)
+        # Remove the consumed values from `tasks` (by value). Keep the zero
+        # sentinel persistent so every iteration retains the "run a group alone"
+        # option (paper's Preprocess semantics); only remove it if `smaller` is
+        # a real group.
+        if smaller != 0:
+            tasks.remove(smaller)
         tasks.remove(largest)
         for pv in pair_vals:
             for val in pv:
                 if val != 0 and val in tasks:
                     tasks.remove(val)
 
-    # Tail iteration: fewer than D groups remain; place them one-per-GPU.
-    if len(tasks) != 0:
-        padded = list(tasks) + [0] * (gpu_num - len(tasks))
+    # Tail iteration: fewer than D real groups remain; place them one-per-GPU.
+    # Exclude the persistent zero sentinel so no phantom all-zero iteration is
+    # appended when only the sentinel is left.
+    tail = [t for t in tasks if t != 0]
+    if len(tail) != 0:
+        padded = tail + [0] * (gpu_num - len(tail))
         cb_tasks.append(padded)
-        for t in tasks:
-            if t != 0:
-                cb_index.append(_find_indices([t], hash_table,
-                                              indicator, consume=True))
+        for t in tail:
+            cb_index.append(_find_indices([t], hash_table,
+                                          indicator, consume=True))
 
     # Summary metrics.
     total_time = 0.0
@@ -240,6 +252,11 @@ def greedy(tasks, gpu_num, lat, reuse):
     for ts in cb_tasks:
         for i, t in enumerate(ts):
             imbalance[i] += t
+
+    # Drop empty slots (from dummy zero-group padding). A zero-length slot would
+    # be misread by the training driver as a paired slot and crash on indexing,
+    # so never expose one to consumers.
+    cb_index = [slot for slot in cb_index if slot]
 
     return total_time, waste, cb_index, total_time / min_time
 

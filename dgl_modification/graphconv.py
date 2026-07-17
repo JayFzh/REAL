@@ -497,12 +497,15 @@ class GraphConv(nn.Module):
           (b) normalization: destination degrees shift from d₁ to d₂
 
         We correct for both by:
-          unnorm = last_tensor * √d₁   # undo old dst normalization
-          unnorm += h_delta             # apply structural delta (unnormalized)
-          updated = unnorm / √d₂       # apply new dst normalization
+          unnorm = last_tensor * √d₁      # undo old dst normalization
+          unnorm += h_delta                # add source-normalized structural delta
+          updated = unnorm / √d₂          # apply new dst normalization
 
-        This is exact for the destination-side term; source-side degree changes
-        are an approximation (assumed small relative to the full neighborhood).
+        The delta is source-normalized by 1/√d_i (current-snapshot degree), so an
+        added edge carries the symmetric weight 1/√(d_i d_j), consistent with the
+        base GraphConv(norm='both'). Removed edges reuse the current-degree factor
+        and the degree shift of unchanged neighbors is not re-applied -- the small
+        approximation noted in the paper.
 
         Args:
             feat:        current node features (after linear projection W), shape (N, F)
@@ -513,33 +516,33 @@ class GraphConv(nn.Module):
         Returns:
             updated_feat: renormalized incremental GCN output, shape (N, F)
         """
-        # Assign current node features to diff_graph
-        diff_graph.ndata["h"] = feat
-
-        # Aggregate neighbor features weighted by edge weights
-        # (added edges have weight +1, removed edges have weight -1)
-        diff_graph.update_all(
-            message_func=fn.u_mul_e('h', 'weight', 'm'),
-            reduce_func=fn.sum(msg='m', out='h_delta')
-        )
-
-        # Unnormalized incremental delta
-        h_delta = diff_graph.ndata['h_delta']
-
         # Retrieve per-node degrees from the DiffMap (built in build_diff_graphs.py)
         prev_deg = diff_graph.ndata['prev_node_degree'].clamp(min=1)  # (N,)
         curr_deg = diff_graph.ndata['curr_node_degree'].clamp(min=1)  # (N,)
 
-        # Reshape for broadcasting over feature dimensions (N, 1, ..., 1)
-        extra_dims = last_tensor.dim() - 1
-        shape = (-1,) + (1,) * extra_dims
+        # Broadcast shape (N, 1, ..., 1) over feature dimensions.
+        shape = (-1,) + (1,) * (feat.dim() - 1)
+
+        # Source-side symmetric normalization 1/sqrt(d_i) on the delta messages,
+        # consistent with the base GraphConv(norm='both'): an added edge then
+        # carries the symmetric weight 1/sqrt(d_i^t d_j^t). Uses current-snapshot
+        # degrees (removed edges reuse this factor; the paper's approximation).
+        diff_graph.ndata["h"] = feat / th.sqrt(curr_deg.view(shape))
+
+        # Aggregate the source-normalized neighbor deltas weighted by +1/-1
+        # (added edges have weight +1, removed edges have weight -1).
+        diff_graph.update_all(
+            message_func=fn.u_mul_e('h', 'weight', 'm'),
+            reduce_func=fn.sum(msg='m', out='h_delta')
+        )
+        h_delta = diff_graph.ndata['h_delta']
+
+        # Destination renormalization (consistent with norm='both'):
+        #   1. Undo the base's 1/sqrt(d_j^{t-1}) to recover the unnormalized aggregate,
+        #   2. add the (source-normalized) structural delta,
+        #   3. reapply 1/sqrt(d_j^t) for the current snapshot.
         prev_deg = prev_deg.view(shape)
         curr_deg = curr_deg.view(shape)
-
-        # Degree renormalization (destination-side, consistent with norm='both'):
-        #   1. Undo old normalization: recover unnormalized aggregate from G1
-        #   2. Apply structural delta
-        #   3. Apply new normalization for G2
         unnorm_prev = last_tensor * th.sqrt(prev_deg)
         updated_feat = (unnorm_prev + h_delta) / th.sqrt(curr_deg)
 
