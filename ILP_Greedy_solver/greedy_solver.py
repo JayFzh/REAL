@@ -258,7 +258,10 @@ def greedy(tasks, gpu_num, lat, reuse):
     # so never expose one to consumers.
     cb_index = [slot for slot in cb_index if slot]
 
-    return total_time, waste, cb_index, total_time / min_time
+    # imbalance = makespan / best-case; guard against min_time == 0 (possible
+    # when lat == 0 and an iteration is zero-padded).
+    imbalance_ratio = total_time / min_time if min_time > 0 else float('inf')
+    return total_time, waste, cb_index, imbalance_ratio
 
 
 if __name__ == "__main__":

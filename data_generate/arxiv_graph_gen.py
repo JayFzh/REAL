@@ -4,8 +4,11 @@ import random
 from ogb.nodeproppred import NodePropPredDataset
 import os
 
+random.seed(0)
+
 # Load the original graph
-dataset = NodePropPredDataset(name='ogbn-arxiv', root='./data')
+dataset = NodePropPredDataset(name='ogbn-arxiv',
+                              root=os.environ.get('ARXIV_DATA_ROOT', './data'))
 graph, labels = dataset[0]
 g = dgl.graph((graph['edge_index'][0], graph['edge_index'][1]))
 g = dgl.to_simple(g)
@@ -18,10 +21,11 @@ edge_list = list(zip(edges[0].tolist(), edges[1].tolist()))
 total_edges = len(edge_list)
 
 # Snapshot parameters
-num_snapshots = 100
+num_snapshots = int(os.environ.get('ARXIV_NUM_SNAPSHOTS', '100'))
 snapshots = []
 prev_edges = set()
-output_dir = "YOUR_ARXIV_OUTPUT_DIR"  # e.g. /path/to/graphs/arxiv/
+output_dir = os.environ.get('ARXIV_OUTPUT_DIR', 'YOUR_ARXIV_OUTPUT_DIR')
+os.makedirs(output_dir, exist_ok=True)
 
 for i in range(num_snapshots):
     # Edge ratio grows linearly from 50% to 90%
@@ -34,7 +38,9 @@ for i in range(num_snapshots):
         retain_count = int(curr_edge_count * 0.9)
         new_count = curr_edge_count - retain_count
 
-        retained_edges = set(random.sample(prev_edges, min(retain_count, len(prev_edges))))
+        # random.sample requires a sequence, not a set (Python 3.11+).
+        retained_edges = set(random.sample(list(prev_edges),
+                                           min(retain_count, len(prev_edges))))
         remaining_pool = list(set(edge_list) - retained_edges)
         new_edges = set(random.sample(remaining_pool, new_count))
 

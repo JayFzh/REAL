@@ -75,6 +75,9 @@ def main():
                     help="group->start map (default: <reuse-log>.groups.txt)")
     ap.add_argument("--solver", choices=["greedy", "ilp"], default="greedy")
     ap.add_argument("--gpus", type=int, required=True, help="D, GPUs per iteration")
+    ap.add_argument("--world-size", type=int, default=1,
+                    help="training world_size; slot count is balanced to a "
+                         "multiple of this so per-rank barriers stay aligned")
     ap.add_argument("--model", choices=list(_MODEL_STRATEGY_LINE), required=True)
     ap.add_argument("--alpha", type=float, default=0.0,
                     help="per-iteration sync overhead")
@@ -91,6 +94,24 @@ def main():
 
     schedule_groups = solve(args.solver, time_costs, reuse, args.gpus,
                             args.alpha, args.gap)
+
+    # Balance the slot count to a multiple of --world-size. training.py calls
+    # dist.barrier() once per slot on each rank (round-robin), so every rank must
+    # see the same number of slots -- i.e. len(schedule) must be a multiple of
+    # world_size, otherwise NCCL barriers mismatch and hang. We split paired
+    # slots into singletons (preserving coverage, losing only that pair's Type-II
+    # reuse) until the count aligns.
+    if args.world_size > 1:
+        def _aligned(s):
+            return len(s) % args.world_size == 0 and len(s) >= args.world_size
+        while not _aligned(schedule_groups):
+            paired = next((i for i, s in enumerate(schedule_groups) if len(s) == 2), None)
+            if paired is None:
+                print(f"[build_strategy] WARN: cannot balance {len(schedule_groups)} "
+                      f"slots to world_size={args.world_size} (no paired slots to split)")
+                break
+            a, b = schedule_groups.pop(paired)
+            schedule_groups += [[a], [b]]
 
     # Map GROUP indices -> snapshot START indices (the P4 translation).
     schedule_starts = [[starts[g] for g in slot] for slot in schedule_groups]
