@@ -27,7 +27,7 @@ def mycallback(model, where):
 
 
 # =============================================================================
-# ILP with reuse -- epigraph min-max linearization (Method-v5.tex Sec. 5.2).
+# ILP with reuse -- epigraph min-max linearization.
 # =============================================================================
 def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
                              L=2, alpha=0.0, ideal_gap=0.02):
@@ -82,8 +82,7 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
              for i in range(max_iter_n)]
 
     # Per-iteration makespan T_i (epigraph variable, paper Eq. minmax_constraint).
-    # Minimizing sum_i T_i drives each T_i to max_j t_gpu_{i,j} + alpha with no
-    # Big-M and no auxiliary binaries.
+    # Minimizing sum_i T_i drives each T_i to max_j t_gpu_{i,j} + alpha.
     T = [model.addVar(lb=0, ub=sum_t + alpha, vtype=GRB.CONTINUOUS, name=f"T_{i}")
          for i in range(max_iter_n)]
 
@@ -140,8 +139,7 @@ def get_snapshot_alloc_reuse(snapshot_n, gpu_n, time_costs, reuse,
     # Min-max via epigraph (paper Eq. minmax_constraint):
     #   T_i >= t_gpu_{i,j} + alpha,   forall j
     # Because the objective minimizes sum_i T_i, each T_i is tightened to
-    # max_j t_gpu_{i,j} + alpha automatically -- no Big-M, no auxiliary binaries.
-    # This is the tightened LP relaxation the paper argues for.
+    # max_j t_gpu_{i,j} + alpha automatically.
     # -------------------------------------------------------------------------
     for i in range(max_iter_n):
         for j in range(gpu_n):

@@ -67,17 +67,18 @@ _DATASET_DIMS = {
 }
 
 
-def _build_model(model_name, dataset, hidden_size, rank):
+def _build_model(model_name, dataset, hidden_size, rank, num_layers=1):
     in_feats, out_feats = _DATASET_DIMS[dataset]
     if model_name == "wdgcn":
-        model = WDGCN(in_feats, hidden_size, out_feats)
+        model = WDGCN(in_feats, hidden_size, out_feats, num_layers=num_layers)
     elif model_name == "tgcn":
-        model = TGCN(in_feats, hidden_size, out_feats)
+        model = TGCN(in_feats, hidden_size, out_feats, num_layers=num_layers)
     elif model_name == "evolvegcn":
         model = EvolveGCN(in_feats=in_feats, n_hidden=hidden_size,
-                          n_classes=out_feats)
+                          n_classes=out_feats, num_layers=num_layers)
     elif model_name == "gatlstm":
-        model = GATLSTM(in_feats, hidden_size, out_feats, num_heads=1)
+        model = GATLSTM(in_feats, hidden_size, out_feats, num_heads=1,
+                        num_layers=num_layers)
     else:
         raise ValueError(f"unknown model: {model_name}")
     return model.to(rank)
@@ -121,7 +122,7 @@ def _profile_once(model, model_name, graphs, changed_nodes, feat, label, rank):
             outs.append(out)
 
         def tail():
-            pred = model._temporal(outs)
+            pred = model._spatio_temporal(outs, graphs, rank)
             loss = F.cross_entropy(pred, label)
             loss.backward()
             return loss
@@ -143,14 +144,14 @@ def _profile_once(model, model_name, graphs, changed_nodes, feat, label, rank):
 
     if model_name == "evolvegcn":
         def tail():
-            pred = model._evolve_and_project(aggs)
+            pred = model._stack(aggs, graphs, rank)
             loss = F.cross_entropy(pred, label)
             loss.backward()
             return loss
     else:
         def tail():
             outs = _project_with_unique_gemm(model.rgcn, aggs, changed_nodes)
-            pred = model._temporal(outs)
+            pred = model._spatio_temporal(outs, graphs, rank)
             loss = F.cross_entropy(pred, label)
             loss.backward()
             return loss
@@ -218,6 +219,8 @@ def main():
                     help="stride between auto-generated sliding-window group starts "
                          "(stride < window yields overlapping groups with reuse)")
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--num-layers", type=int, default=1,
+                    help="number of GNN layers (reuse applies to the first)")
     ap.add_argument("--repeats", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--device", type=int, default=0)
@@ -246,7 +249,8 @@ def main():
     feat, label = _DATASET_CONFIG[args.dataset]["load_fn"](data_root)
     feat = feat.float().to(rank)
     label = label.long().to(rank)
-    model = _build_model(args.model, args.dataset, args.hidden, rank)
+    model = _build_model(args.model, args.dataset, args.hidden, rank,
+                         num_layers=args.num_layers)
 
     n = len(starts)
     time_costs = [0.0] * n

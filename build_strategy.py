@@ -95,12 +95,9 @@ def main():
     schedule_groups = solve(args.solver, time_costs, reuse, args.gpus,
                             args.alpha, args.gap)
 
-    # Balance the slot count to a multiple of --world-size. training.py calls
-    # dist.barrier() once per slot on each rank (round-robin), so every rank must
-    # see the same number of slots -- i.e. len(schedule) must be a multiple of
-    # world_size, otherwise NCCL barriers mismatch and hang. We split paired
-    # slots into singletons (preserving coverage, losing only that pair's Type-II
-    # reuse) until the count aligns.
+    # Balance the slot count to a multiple of world_size so each rank receives
+    # the same number of slots. Paired slots are split into singletons (which
+    # preserves coverage) until the count aligns.
     if args.world_size > 1:
         def _aligned(s):
             return len(s) % args.world_size == 0 and len(s) >= args.world_size

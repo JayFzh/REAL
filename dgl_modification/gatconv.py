@@ -336,10 +336,8 @@ class GATConv(nn.Module):
             # compute edge attention, el and er are a_l Wh_i and a_r Wh_j respectively.
             graph.apply_edges(fn.u_add_v("el", "er", "e"))
             e = self.leaky_relu(graph.edata.pop("e"))
-            # compute softmax (also returns the per-node max used as a numerically
-            # stable shift; it is cached so the incremental path reuses the SAME
-            # shift, keeping exp() from overflowing in fp32 while leaving the
-            # shift-invariant softmax output unchanged).
+            # edge softmax; also returns the per-node denominator and max logit
+            # so the incremental path can update attention across snapshots.
             res, node_denom, node_max = self.edge_softmax_with_denominator(graph,e)
             graph.edata["a"] = self.attn_drop(res)
             if edge_weight is not None:
@@ -384,12 +382,9 @@ class GATConv(nn.Module):
         graph.apply_edges(fn.u_add_v("el", "er", "e"))
         e = self.leaky_relu(graph.edata.pop("e"))
 
-        # --- numerically stable incremental softmax (online-softmax rescale) ---
-        # A newly ADDED edge can have a logit larger than the cached per-node max
-        # (old_node_max), so exp(e - old_node_max) could overflow. We therefore
-        # raise the shift to node_max = max(old_node_max, max logit over added
-        # edges), rescale the cached denominator into that frame, and only then
-        # add the incremental contributions -- all exponents are then <= 0.
+        # Shift the softmax by the per-node max logit. The shift covers both the
+        # cached edges and the newly added edges, so it is the larger of the
+        # cached per-node max and the max logit over the added edges.
         _, dst = graph.edges(order="eid")
         N = graph.num_nodes()
         extra = e.shape[1:]
@@ -397,27 +392,23 @@ class GATConv(nn.Module):
         added = (diff_value > 0).view((-1,) + (1,) * (e.dim() - diff_value.dim())
                                       ).expand_as(e) if diff_value.dim() < e.dim() \
                 else (diff_value > 0)
-        e_added = e.masked_fill(~added, float("-inf"))          # keep only added-edge logits
+        e_added = e.masked_fill(~added, float("-inf"))
         added_max = e.new_full((N,) + extra, float("-inf")).scatter_reduce(
             0, idx, e_added, reduce="amax", include_self=True)
-        node_max = th.maximum(old_node_max, added_max)          # monotone upper bound
-        # rescale cached denominator D1 from the old shift to the new shift
+        node_max = th.maximum(old_node_max, added_max)
+        # Re-express the cached denominator under the updated shift.
         denom_rescaled = old_node_denom * th.exp(old_node_max - node_max)
 
-        # incremental denominator delta and per-edge weights, all with shift node_max
+        # Incremental denominator change and per-edge weights under the same shift.
         incre_node_demon, edge_weight_no_norm = self.get_numer_with_pm(
             graph, e, diff_value, node_max=node_max)
         node_denom = denom_rescaled + incre_node_demon
-        # Safety net: removing a DOMINANT (max-logit) edge can drive the
-        # incremental denominator to <= 0 via catastrophic cancellation when
-        # logit gaps exceed fp32's dynamic range (an inherent limitation of
-        # incremental softmax; occurs only at extreme feature scales, never at
-        # normal ones). Fall back to the pre-update denominator there so the
-        # output stays finite/bounded instead of NaN/Inf.
+        # Keep the denominator strictly positive before normalizing.
         eps = 1e-12
         safe_denom = th.where(node_denom > eps, node_denom,
                               denom_rescaled.clamp_min(eps))
-        # rescale the cached (softmax-normalized) aggregation by the denom ratio
+        # Rescale the cached aggregation by the denominator ratio and add the
+        # contribution of the changed edges.
         last_tensor = last_tensor * denom_rescaled / safe_denom
         graph.edata["a"] = self.attn_drop(self.normalize_edge_weight(graph, edge_weight_no_norm, safe_denom, norm_by="dst"))
         graph.update_all(fn.u_mul_e("ft", "a", "m"), fn.sum("m", "ft"))
@@ -430,17 +421,13 @@ class GATConv(nn.Module):
                                     norm_by = "dst",
                                     eps = 1e-12):
         """
-        Manually compute edge softmax and return the per-edge softmax weights,
-        the per-node denominator (sum exp), and the per-node max logit used as a
-        numerically stable shift.
+        Compute the edge softmax and return the per-edge weights, the per-node
+        denominator (sum of exp), and the per-node max logit.
 
         The softmax is computed as exp(z - m_j) / sum_k exp(z_k - m_j), where m_j
-        is the per-node (grouped by ``norm_by``) max logit. Subtracting m_j is the
-        standard log-sum-exp stabilization: the result is identical to the naive
-        exp(z)/sum exp(z) but cannot overflow in fp32. The returned ``node_max``
-        is cached so the incremental path (increGAT_forward / get_numer_with_pm)
-        reuses the SAME shift, which is required for the incremental denominator
-        update D2 = D1 + delta to stay consistent.
+        is the per-node max logit (grouped by ``norm_by``). The max logit is
+        returned so the incremental path can update the denominator across
+        snapshots under a consistent shift.
 
         Args:
             graph:   DGLGraph (homogeneous)
@@ -463,16 +450,16 @@ class GATConv(nn.Module):
         N = graph.num_nodes()
         extra_shape = logits.shape[1:]
 
-        # Per-node max logit (stable-softmax shift). Detached: a constant shift
-        # does not change the softmax or its gradient, so it must not carry grad.
+        # Per-node max logit used as the softmax shift. Detached: a constant
+        # shift leaves the softmax and its gradient unchanged.
         idx_exp = index.view((-1,) + (1,) * len(extra_shape)).expand_as(logits)
         node_max = logits.new_full((N,) + extra_shape, float("-inf"))
         node_max = node_max.scatter_reduce(0, idx_exp, logits.detach(),
                                            reduce="amax", include_self=True)
-        # nodes with no in-edges keep -inf -> use 0 shift for them
+        # Nodes with no in-edges keep -inf; use a zero shift for them.
         node_max = th.nan_to_num(node_max, neginf=0.0)
 
-        # exp(z - m_j)  (bounded by 1 for the max edge; no overflow)
+        # exp(z - m_j)
         max_on_edges = node_max.index_select(0, index)
         exp_logits = th.exp(logits - max_on_edges)
 
@@ -523,11 +510,10 @@ class GATConv(nn.Module):
         For each edge (i->j): edge_weight = exp(logit - m_j) * pm,
         then sum edge_weight grouped by node (dst or src).
 
-        ``node_max`` (m_j) is the per-node stable-softmax shift cached from the
-        base snapshot's edge_softmax_with_denominator. Using the SAME shift here
-        as was used to build the cached denominator keeps the incremental update
-        D2 = D1 + delta exact while preventing exp() overflow in fp32. If
-        ``node_max`` is None, no shift is applied (backward-compatible).
+        ``node_max`` (m_j) is the per-node softmax shift from the base snapshot.
+        Applying the same shift used to build the cached denominator keeps the
+        incremental update consistent. If ``node_max`` is None, no shift is
+        applied.
 
         Args:
             graph:    DGLGraph
@@ -565,7 +551,7 @@ class GATConv(nn.Module):
         pm_expanded = pm_expanded.to(device)
         index = index.to(device)
 
-        # Apply the SAME per-node stable-softmax shift as the cached denominator.
+        # Apply the per-node softmax shift used by the cached denominator.
         if node_max is not None:
             logits = logits - node_max.index_select(0, index)
 

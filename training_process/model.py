@@ -41,7 +41,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 from torch.nn.parameter import Parameter
+import dgl
 from dgl.nn.pytorch import GraphConv, GATConv
+
+
+# =============================================================================
+# Deeper spatio-temporal encoders.
+#
+# A layer is one (GNN, RNN) block. Reuse (IncreConv, selective MatMul, the
+# triple-stream pipeline, and Type-II group reuse) applies only at the first
+# block's GNN, where the input node features are time-invariant within a
+# snapshot group. Higher blocks take the previous block's per-snapshot RNN
+# output as input, which varies across snapshots, so their GNN is recomputed in
+# full on the actual snapshot graph -- reconstructed here from the base snapshot
+# and the subsequent DiffMaps (added edges carry weight +1, removed edges -1).
+# =============================================================================
+
+def _reconstruct_full_graph_seq(g_list, device):
+    """Rebuild the full snapshot graph at each position of a group.
+
+    ``g_list`` is ``[base_snapshot, dmap_1, ..., dmap_{T-1}]``; each DiffMap
+    carries ``edata['weight']`` of +1 for added edges and -1 for removed edges.
+    Applying a DiffMap to the running edge set yields the next full snapshot.
+    Returns ``[G_0, ..., G_{T-1}]`` on ``device``.
+    """
+    base = g_list[0]
+    n = base.num_nodes()
+    su, sv = base.edges()
+    codes = su.to(device).long() * n + sv.to(device).long()
+    graphs = [base.to(device)]
+    for dm in g_list[1:]:
+        du, dv = dm.edges()
+        e = du.to(device).long() * n + dv.to(device).long()
+        w = dm.edata['weight'].to(device)
+        codes = torch.unique(torch.cat([codes, e[w > 0]]))
+        removed = e[w < 0]
+        if removed.numel():
+            codes = codes[~torch.isin(codes, removed)]
+        graphs.append(dgl.graph((codes // n, codes % n), num_nodes=n))
+    return graphs
 
 
 # =============================================================================
@@ -97,7 +135,7 @@ class IntraReuseGAT(nn.Module):
         super().__init__()
         # activation=None: cache/increment the PRE-activation aggregation so the
         # softmax-denominator rescale identity holds; ReLU is applied uniformly
-        # in GATLSTM._temporal before the RNN.
+        # before each block's LSTM.
         self.gat = GATConv(
             in_feats, hidden_size,
             num_heads=num_heads,
@@ -380,22 +418,16 @@ def _pipeline_evolve_aggregate(rgcn, g_list, feat, rank,
 # Temporal heads: mini-batched LSTM / GRU to bound peak memory on large N.
 # =============================================================================
 
-def _rnn_last_step(rnn, per_snapshot_feats, hidden_state=None,
-                   batch_nodes=4096 * 256):
-    """Stack features into [N, T, F], run the RNN in node-batches, return
-    the last timestep's hidden for each node."""
+def _rnn_apply(rnn, per_snapshot_feats, batch_nodes=4096 * 256):
+    """Stack features into [N, T, F], run the RNN in node-batches, and return
+    the full output sequence [N, T, F]. Intermediate (GNN, RNN) blocks pass this
+    sequence to the next block; the final block uses only its last timestep."""
     seq = torch.stack(per_snapshot_feats, dim=1)
     out_chunks = []
-    final_hidden = None
     for start in range(0, seq.size(0), batch_nodes):
-        batch = seq[start:start + batch_nodes]
-        if hidden_state is None:
-            out, final_hidden = rnn(batch)
-        else:
-            out, final_hidden = rnn(batch, hidden_state)
+        out, _ = rnn(seq[start:start + batch_nodes])
         out_chunks.append(out)
-    full = torch.cat(out_chunks, dim=0)
-    return full[:, -1, :], final_hidden
+    return torch.cat(out_chunks, dim=0)
 
 
 # =============================================================================
@@ -405,23 +437,42 @@ def _rnn_last_step(rnn, per_snapshot_feats, hidden_state=None,
 class _GCNReuseMixin:
     """
     Subclasses must provide:
-        self.rgcn        : IntraReuseConv
-        self._head(x)    : takes [N, hidden] -> classifier logits
-        self._rnn        : nn.LSTM / nn.GRU (used by self._temporal)
+        self.rgcn     : IntraReuseConv (the first block's GNN, reuse-aware)
+        self.gnns     : nn.ModuleList of GraphConv (blocks 2..k, full recompute)
+        self.rnns     : nn.ModuleList of nn.LSTM / nn.GRU (one per block)
+        self._head(x) : takes [N, hidden] -> classifier logits
+        self.num_layers
     """
 
-    def _temporal(self, per_snapshot_feats):
-        last, _ = _rnn_last_step(self._rnn, per_snapshot_feats)
-        return self._head(last)
+    def _spatio_temporal(self, outs, g_list, device):
+        """Stack of (GNN, RNN) blocks. ``outs`` is the first block's GNN output
+        (from the reuse path); blocks 2..k recompute their GNN in full on the
+        snapshots reconstructed from base+DiffMaps. Each block's RNN runs over
+        the snapshot sequence -- intermediate blocks pass the full hidden-state
+        sequence on to the next block, the last block feeds its final timestep
+        to the classifier."""
+        n = len(outs)
+        fulls = None
+        for b in range(self.num_layers):
+            if b > 0:
+                if fulls is None:
+                    fulls = _reconstruct_full_graph_seq(g_list, device)
+                conv = self.gnns[b - 1]
+                outs = [conv(fulls[i], F.relu(outs[i])) for i in range(n)]
+            seq = _rnn_apply(self.rnns[b], outs)
+            if b < self.num_layers - 1:
+                outs = [seq[:, t, :] for t in range(n)]
+            else:
+                return self._head(seq[:, -1, :])
 
     def forward_intra(self, g_list, changed_nodes, feat):
         aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
         outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
-        return self._temporal(outs)
+        return self._spatio_temporal(outs, g_list, feat.device)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
         outs, _ = _pipeline_gcn(self.rgcn, g_list, changed_nodes, feat, rank)
-        return self._temporal(outs)
+        return self._spatio_temporal(outs, g_list, rank)
 
     def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx,
                            rank=None, use_3stream=False):
@@ -436,7 +487,8 @@ class _GCNReuseMixin:
             aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
             saved = [aggregations[i] for i in sorted(inter_reuse_idx)]
             outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
-        return self._temporal(outs), saved
+        dev = rank if rank is not None else feat.device
+        return self._spatio_temporal(outs, g_list, dev), saved
 
     def forward_inter_apply(self, g_list, feat, changed_nodes, inter_reuse_idx,
                             cached_aggregations, rank=None, use_3stream=False):
@@ -450,18 +502,19 @@ class _GCNReuseMixin:
         if use_3stream:
             outs, _ = _pipeline_gcn(self.rgcn, g_list, changed_nodes, feat, rank,
                                     cached=cached)
-            return self._temporal(outs)
-        aggregations = [None] * len(g_list)
-        for i in range(len(g_list)):
-            if i in cached:
-                aggregations[i] = cached[i]
-            elif i == 0:
-                aggregations[i] = self.rgcn(g_list[i], feat)
-            else:
-                aggregations[i] = self.rgcn.incre_aggregate(
-                    feat, aggregations[i - 1], g_list[i])
-        outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
-        return self._temporal(outs)
+        else:
+            aggregations = [None] * len(g_list)
+            for i in range(len(g_list)):
+                if i in cached:
+                    aggregations[i] = cached[i]
+                elif i == 0:
+                    aggregations[i] = self.rgcn(g_list[i], feat)
+                else:
+                    aggregations[i] = self.rgcn.incre_aggregate(
+                        feat, aggregations[i - 1], g_list[i])
+            outs = _project_with_unique_gemm(self.rgcn, aggregations, changed_nodes)
+        dev = rank if rank is not None else feat.device
+        return self._spatio_temporal(outs, g_list, dev)
 
 
 # =============================================================================
@@ -469,10 +522,17 @@ class _GCNReuseMixin:
 # =============================================================================
 
 class WDGCN(nn.Module, _GCNReuseMixin):
-    def __init__(self, in_feats, hidden_size, out_feats):
+    def __init__(self, in_feats, hidden_size, out_feats, num_layers=1):
         super().__init__()
+        self.num_layers = num_layers
         self.rgcn = IntraReuseConv(in_feats, hidden_size)
-        self._rnn = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        self.gnns = nn.ModuleList([
+            GraphConv(hidden_size, hidden_size, norm='both',
+                      activation=None, allow_zero_in_degree=True)
+            for _ in range(num_layers - 1)])
+        self.rnns = nn.ModuleList([
+            nn.LSTM(hidden_size, hidden_size, batch_first=True)
+            for _ in range(num_layers)])
         self.fc = nn.Linear(hidden_size, out_feats)
 
     def _head(self, x):
@@ -484,10 +544,17 @@ class WDGCN(nn.Module, _GCNReuseMixin):
 # =============================================================================
 
 class TGCN(nn.Module, _GCNReuseMixin):
-    def __init__(self, in_feats, hidden_size, out_feats):
+    def __init__(self, in_feats, hidden_size, out_feats, num_layers=1):
         super().__init__()
+        self.num_layers = num_layers
         self.rgcn = IntraReuseConv(in_feats, hidden_size)
-        self._rnn = nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self.gnns = nn.ModuleList([
+            GraphConv(hidden_size, hidden_size, norm='both',
+                      activation=None, allow_zero_in_degree=True)
+            for _ in range(num_layers - 1)])
+        self.rnns = nn.ModuleList([
+            nn.GRU(hidden_size, hidden_size, batch_first=True)
+            for _ in range(num_layers)])
         self.fc = nn.Linear(hidden_size, out_feats)
 
     def _head(self, x):
@@ -542,37 +609,66 @@ class EvolveGCN(nn.Module):
     unique_gemm does not apply; only aggregation (IncreConv) is reused.
     """
 
-    def __init__(self, in_feats, n_hidden, n_classes, classifier_hidden=307):
+    def __init__(self, in_feats, n_hidden, n_classes, classifier_hidden=307,
+                 num_layers=1):
         super().__init__()
+        self.num_layers = num_layers
         self.in_feats = in_feats
         self.n_hidden = n_hidden
-        self.W_init = Parameter(torch.Tensor(in_feats, n_hidden))
-        init.xavier_uniform_(self.W_init)
-        self.matgru = _MatGRUCell(in_feats, n_hidden)
         self.rgcn = IntraReuseConv(in_feats, n_hidden)
+        # Per-layer evolving weights (matrix GRU): layer 1 maps in_feats ->
+        # n_hidden, higher layers n_hidden -> n_hidden.
+        dims = [in_feats] + [n_hidden] * (num_layers - 1)
+        self.W_inits = nn.ParameterList(
+            [Parameter(torch.Tensor(d, n_hidden)) for d in dims])
+        for w in self.W_inits:
+            init.xavier_uniform_(w)
+        self.matgrus = nn.ModuleList([_MatGRUCell(d, n_hidden) for d in dims])
+        # Higher layers aggregate in full on the reconstructed snapshots; the
+        # evolved weight (above) applies the projection, so these are weightless.
+        self.gnns = nn.ModuleList([
+            GraphConv(n_hidden, n_hidden, norm='both', weight=False, bias=False,
+                      activation=None, allow_zero_in_degree=True)
+            for _ in range(num_layers - 1)])
         self.mlp = nn.Sequential(
             nn.Linear(n_hidden, classifier_hidden),
             nn.ReLU(),
             nn.Linear(classifier_hidden, n_classes),
         )
 
-    def _evolve_and_project(self, aggregations):
-        """Apply the per-snapshot evolved weight to each aggregation."""
-        W = self.W_init
-        gemm_out = None
+    def _evolve_layer(self, aggregations, W_init, matgru):
+        """One evolving-weight GCN layer: project each snapshot's aggregation
+        with a weight the matrix GRU evolves across the snapshot sequence."""
+        W = W_init
+        outs = []
         for agg in aggregations:
-            W = self.matgru(W)
-            gemm_out = torch.matmul(F.relu(agg), W)
-        return self.mlp(gemm_out)
+            W = matgru(W)
+            outs.append(torch.matmul(F.relu(agg), W))
+        return outs
+
+    def _stack(self, aggregations, g_list, device):
+        """Stack of evolving-GCN layers. ``aggregations`` is the first layer's
+        aggregation (from the reuse path); higher layers recompute aggregation
+        in full on the reconstructed snapshots. Classify from the last snapshot,
+        whose evolved weight has absorbed the full history."""
+        h = self._evolve_layer(aggregations, self.W_inits[0], self.matgrus[0])
+        fulls = None
+        for b in range(1, self.num_layers):
+            if fulls is None:
+                fulls = _reconstruct_full_graph_seq(g_list, device)
+            aggs = [self.gnns[b - 1](fulls[i], F.relu(h[i]))
+                    for i in range(len(h))]
+            h = self._evolve_layer(aggs, self.W_inits[b], self.matgrus[b])
+        return self.mlp(h[-1])
 
     def forward_intra(self, g_list, changed_nodes, feat):
         aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
-        return self._evolve_and_project(aggregations)
+        return self._stack(aggregations, g_list, feat.device)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
         aggregations, _ = _pipeline_evolve_aggregate(
             self.rgcn, g_list, feat, rank)
-        return self._evolve_and_project(aggregations)
+        return self._stack(aggregations, g_list, rank)
 
     def forward_inter_save(self, g_list, feat, changed_nodes, inter_reuse_idx,
                            rank=None, use_3stream=False):
@@ -582,7 +678,8 @@ class EvolveGCN(nn.Module):
         else:
             aggregations = _aggregate_group_gcn(self.rgcn, g_list, feat)
             saved = [aggregations[i] for i in sorted(inter_reuse_idx)]
-        return self._evolve_and_project(aggregations), saved
+        dev = rank if rank is not None else feat.device
+        return self._stack(aggregations, g_list, dev), saved
 
     def forward_inter_apply(self, g_list, feat, changed_nodes,
                             inter_reuse_idx, cached_aggregations,
@@ -605,7 +702,8 @@ class EvolveGCN(nn.Module):
                 else:
                     aggregations[i] = self.rgcn.incre_aggregate(
                         feat, aggregations[i - 1], g_list[i])
-        return self._evolve_and_project(aggregations)
+        dev = rank if rank is not None else feat.device
+        return self._stack(aggregations, g_list, dev)
 
 
 # =============================================================================
@@ -613,22 +711,23 @@ class EvolveGCN(nn.Module):
 # =============================================================================
 
 class GATLSTM(nn.Module):
-    def __init__(self, in_feats, hidden_size, out_feats, num_heads=4):
+    def __init__(self, in_feats, hidden_size, out_feats, num_heads=4,
+                 num_layers=1):
         super().__init__()
         self.num_heads = num_heads
+        self.num_layers = num_layers
         self.rgat = IntraReuseGAT(in_feats, hidden_size, num_heads)
-        self._rnn = nn.LSTM(hidden_size * num_heads, hidden_size,
-                            batch_first=True)
+        # Higher-block GNNs: full GAT on the reconstructed snapshots, taking the
+        # previous block's LSTM output and producing multi-head features.
+        self.gnns = nn.ModuleList([
+            GATConv(hidden_size, hidden_size, num_heads=num_heads,
+                    activation=None, bias=False, residual=False,
+                    allow_zero_in_degree=True)
+            for _ in range(num_layers - 1)])
+        self.rnns = nn.ModuleList([
+            nn.LSTM(hidden_size * num_heads, hidden_size, batch_first=True)
+            for _ in range(num_layers)])
         self.fc = nn.Linear(hidden_size, out_feats)
-
-    # --- temporal ---------------------------------------------------------
-
-    def _temporal(self, per_snapshot_feats):
-        flat = [F.relu(h).flatten(1) for h in per_snapshot_feats]
-        last, _ = _rnn_last_step(self._rnn, flat)
-        return self.fc(last)
-
-    # --- intra ------------------------------------------------------------
 
     def _aggregate_group_gat(self, g_list, feat):
         """Run the GAT stage with Type-I reuse; returns per-snapshot outputs and
@@ -646,13 +745,34 @@ class GATLSTM(nn.Module):
             caches.append(reuse_cache)
         return outs, caches
 
+    def _spatio_temporal(self, outs, g_list, device):
+        """Stack of (GAT, LSTM) blocks. ``outs`` is the first block's GAT output
+        (from the reuse path); higher blocks recompute the GAT in full on the
+        reconstructed snapshots, taking the previous block's LSTM output. Each
+        block's LSTM runs over the snapshot sequence; the last block feeds its
+        final timestep to the classifier."""
+        n = len(outs)
+        fulls = None
+        for b in range(self.num_layers):
+            if b > 0:
+                if fulls is None:
+                    fulls = _reconstruct_full_graph_seq(g_list, device)
+                gat = self.gnns[b - 1]
+                outs = [gat(fulls[i], F.relu(outs[i])) for i in range(n)]
+            flat = [F.relu(h).flatten(1) for h in outs]
+            seq = _rnn_apply(self.rnns[b], flat)
+            if b < self.num_layers - 1:
+                outs = [seq[:, t, :] for t in range(n)]
+            else:
+                return self.fc(seq[:, -1, :])
+
     def forward_intra(self, g_list, changed_nodes, feat):
         outs, _ = self._aggregate_group_gat(g_list, feat)
-        return self._temporal(outs)
+        return self._spatio_temporal(outs, g_list, feat.device)
 
     def forward_intra_3stream(self, g_list, changed_nodes, feat, rank):
         outs, _ = _pipeline_gat(self.rgat, g_list, changed_nodes, feat, rank)
-        return self._temporal(outs)
+        return self._spatio_temporal(outs, g_list, rank)
 
     # --- inter ------------------------------------------------------------
 
@@ -666,7 +786,8 @@ class GATLSTM(nn.Module):
             # Cache both the output and the attention intermediates so the next
             # group can continue INCREMENTALLY from the overlap prefix.
             saved = [(outs[i], caches[i]) for i in sorted(inter_reuse_idx)]
-        return self._temporal(outs), saved
+        dev = rank if rank is not None else feat.device
+        return self._spatio_temporal(outs, g_list, dev), saved
 
     def forward_inter_apply(self, g_list, feat, changed_nodes, inter_reuse_idx,
                             cached, rank=None, use_3stream=False):
@@ -678,20 +799,21 @@ class GATLSTM(nn.Module):
         if use_3stream:
             outs, _ = _pipeline_gat(self.rgat, g_list, changed_nodes, feat, rank,
                                     cached=cached_map)
-            return self._temporal(outs)
-        # Sequential (no 3-stream): reuse (out, reuse_cache) over the overlap
-        # prefix, then continue incrementally over the suffix. This uses the
-        # cached attention intermediates so the first suffix snapshot is an
-        # incremental update rather than a (wrong) full forward on a DiffMap.
-        outs = [None] * len(g_list)
-        reuse_cache = None
-        for i in range(len(g_list)):
-            if i in cached_map:
-                out, reuse_cache = cached_map[i]
-            elif reuse_cache is None:
-                out, reuse_cache = self.rgat(g_list[i], feat)
-            else:
-                out, reuse_cache = self.rgat.incre_forward(
-                    g_list[i], reuse_cache, outs[i - 1], changed_nodes=None)
-            outs[i] = out
-        return self._temporal(outs)
+        else:
+            # Sequential (no 3-stream): reuse (out, reuse_cache) over the overlap
+            # prefix, then continue incrementally over the suffix. This uses the
+            # cached attention intermediates so the first suffix snapshot is an
+            # incremental update rather than a (wrong) full forward on a DiffMap.
+            outs = [None] * len(g_list)
+            reuse_cache = None
+            for i in range(len(g_list)):
+                if i in cached_map:
+                    out, reuse_cache = cached_map[i]
+                elif reuse_cache is None:
+                    out, reuse_cache = self.rgat(g_list[i], feat)
+                else:
+                    out, reuse_cache = self.rgat.incre_forward(
+                        g_list[i], reuse_cache, outs[i - 1], changed_nodes=None)
+                outs[i] = out
+        dev = rank if rank is not None else feat.device
+        return self._spatio_temporal(outs, g_list, dev)

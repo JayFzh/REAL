@@ -432,7 +432,6 @@ class GraphConv(nn.Module):
 
             # (BarclayII) For RGCN on heterogeneous graphs we need to support GCN on bipartite.
             feat_src, feat_dst = expand_as_pair(feat, graph)
-            # print('427:',feat_src)
             if self._norm in ["left", "both"]:
                 degs = graph.out_degrees().to(feat_src).clamp(min=1)
                 if self._norm == "both":
@@ -442,7 +441,6 @@ class GraphConv(nn.Module):
                 shp = norm.shape + (1,) * (feat_src.dim() - 1)
                 norm = th.reshape(norm, shp)
                 feat_src = feat_src * norm
-            # print('437:',feat_src)
             if weight is not None:
                 if self.weight is not None:
                     raise DGLError(

@@ -97,9 +97,8 @@ def _find_closest_pair_reuse(lst, target, reuse, hash_table, indicator):
         else:
             current_sum = lst[left] + lst[right]
 
-        # Always record the reuse-adjusted sum of the chosen pair (the previous
-        # version seeded closest_sum with the UN-adjusted lst[left]+lst[right],
-        # so a returned pair could drop its reuse benefit from the load).
+        # Track the pair whose reuse-adjusted sum is closest to the target,
+        # breaking ties toward the larger sum.
         if (closest_pair is None
                 or abs(current_sum - target) < abs(closest_sum - target)
                 or (abs(current_sum - target) == abs(closest_sum - target)
@@ -253,13 +252,10 @@ def greedy(tasks, gpu_num, lat, reuse):
         for i, t in enumerate(ts):
             imbalance[i] += t
 
-    # Drop empty slots (from dummy zero-group padding). A zero-length slot would
-    # be misread by the training driver as a paired slot and crash on indexing,
-    # so never expose one to consumers.
+    # Keep only slots that hold real groups (zero-group padding leaves none).
     cb_index = [slot for slot in cb_index if slot]
 
-    # imbalance = makespan / best-case; guard against min_time == 0 (possible
-    # when lat == 0 and an iteration is zero-padded).
+    # Imbalance ratio: makespan over the best-case time (inf if best case is 0).
     imbalance_ratio = total_time / min_time if min_time > 0 else float('inf')
     return total_time, waste, cb_index, imbalance_ratio
 

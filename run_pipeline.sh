@@ -10,16 +10,16 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DATASET="${DATASET:-wiki}"
+DATASET="${DATASET:-arxiv}"
 MODEL="${MODEL:-wdgcn}"
-WINDOW="${WINDOW:-2}"
-NUM_SNAPSHOTS="${NUM_SNAPSHOTS:-6}"
+WINDOW="${WINDOW:-4}"
+NUM_SNAPSHOTS="${NUM_SNAPSHOTS:-30}"
 STRIDE="${STRIDE:-1}"
 SOLVER="${SOLVER:-greedy}"          # greedy (REAL-G) or ilp (REAL-L, needs gurobipy)
-GPUS="${GPUS:-2}"                    # D: GPUs per iteration (scheduler)
-WORLD_SIZE="${WORLD_SIZE:-1}"        # training processes
+GPUS="${GPUS:-8}"                    # D: GPUs per iteration (scheduler)
+WORLD_SIZE="${WORLD_SIZE:-8}"        # training processes
 HIDDEN="${HIDDEN:-64}"
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-50}"
 DEVICE="${DEVICE:-0}"
 OUTDIR="${OUTDIR:-/tmp/real_pipeline}"
 
@@ -36,7 +36,7 @@ python "$HERE/training_process/profiler.py" \
 echo "==> [2/3] Building strategy ($SOLVER, $GPUS GPUs) with group->start mapping"
 python "$HERE/build_strategy.py" \
     --reuse-log "$REUSE_LOG" --solver "$SOLVER" --gpus "$GPUS" \
-    --model "$MODEL" --out "$STRATEGY"
+    --world-size "$WORLD_SIZE" --model "$MODEL" --out "$STRATEGY"
 
 echo "==> [3/3] Training ($MODEL, world_size=$WORLD_SIZE)"
 python "$HERE/training_process/training.py" \

@@ -48,9 +48,10 @@ _DATASET_DIMS = {
 _MODEL_STRATEGY_LINE = {"evolvegcn": 2, "wdgcn": 4, "tgcn": 6, "gatlstm": 8}
 
 
-def _build_model(model_name, dataset, hidden_size, rank):
+def _build_model(model_name, dataset, hidden_size, rank, num_layers=1):
     in_feats, out_feats = _DATASET_DIMS[dataset]
-    kwargs = dict(in_feats=in_feats, hidden_size=hidden_size, out_feats=out_feats)
+    kwargs = dict(in_feats=in_feats, hidden_size=hidden_size, out_feats=out_feats,
+                  num_layers=num_layers)
     if model_name == "wdgcn":
         model = WDGCN(**kwargs)
     elif model_name == "tgcn":
@@ -59,7 +60,8 @@ def _build_model(model_name, dataset, hidden_size, rank):
         # EvolveGCN uses slightly different hyperparameter names.
         model = EvolveGCN(in_feats=in_feats,
                           n_hidden=hidden_size,
-                          n_classes=out_feats)
+                          n_classes=out_feats,
+                          num_layers=num_layers)
     elif model_name == "gatlstm":
         model = GATLSTM(**kwargs, num_heads=1)
     else:
@@ -201,9 +203,9 @@ def _run_paired_slot(model, optimizer, g_lists, changed_nodes, inter_indices,
 
 
 def train(rank, dataset, model_name, world_size, time_window_size, num_epochs,
-          strategy_path, hidden_size, use_3stream):
+          strategy_path, hidden_size, use_3stream, num_layers=1):
     print(f"[rank {rank}] training model={model_name} dataset={dataset}, "
-          f"window={time_window_size}, 3stream={use_3stream}")
+          f"window={time_window_size}, layers={num_layers}, 3stream={use_3stream}")
     dist.init_process_group("nccl", "tcp://127.0.0.1:12347",
                             world_size=world_size, rank=rank)
     torch.cuda.set_device(rank)
@@ -217,7 +219,7 @@ def train(rank, dataset, model_name, world_size, time_window_size, num_epochs,
     label = label.to(rank)
     feat = feat.to(rank)
 
-    model = _build_model(model_name, dataset, hidden_size, rank)
+    model = _build_model(model_name, dataset, hidden_size, rank, num_layers)
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
@@ -261,6 +263,9 @@ def main():
     parser.add_argument("--time_window_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=2)
     parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=1,
+                        help="number of GNN layers; reuse applies to the first "
+                             "layer, higher layers recompute in full")
     parser.add_argument("--strategy_path", type=str,
                         default="YOUR_STRATEGY_FILE",
                         help="Text file containing the scheduler's output")
@@ -273,7 +278,7 @@ def main():
         train,
         args=(args.dataset, args.model, args.world_size, args.time_window_size,
               args.num_epochs, args.strategy_path, args.hidden_size,
-              not args.no_3stream),
+              not args.no_3stream, args.num_layers),
         nprocs=args.world_size,
         join=True,
     )

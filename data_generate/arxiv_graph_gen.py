@@ -38,7 +38,6 @@ for i in range(num_snapshots):
         retain_count = int(curr_edge_count * 0.9)
         new_count = curr_edge_count - retain_count
 
-        # random.sample requires a sequence, not a set (Python 3.11+).
         retained_edges = set(random.sample(list(prev_edges),
                                            min(retain_count, len(prev_edges))))
         remaining_pool = list(set(edge_list) - retained_edges)
@@ -49,8 +48,6 @@ for i in range(num_snapshots):
     # Build DGLGraph snapshot
     src, dst = zip(*curr_edges)
     sg = dgl.graph((torch.tensor(src), torch.tensor(dst)), num_nodes=g.num_nodes())
-    # sg.ndata['feat'] = g.ndata['feat']
-    # sg.ndata['label'] = g.ndata['label']
     snapshots.append(sg)
     prev_edges = curr_edges
 
