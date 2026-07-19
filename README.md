@@ -2,6 +2,11 @@
 
 **Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load-Balancing Scheduling**
 
+> Official implementation of our **SC '26** paper, *REAL: Efficient Distributed
+> Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling*
+> (to appear in the ACM/IEEE International Conference for High Performance
+> Computing, Networking, Storage, and Analysis).
+
 REAL is a distributed training framework for dynamic graph neural networks
 (DGNNs) on discrete-time dynamic graphs (DTDGs). It exploits the high structural
 similarity between consecutive snapshots to skip redundant computation, and
@@ -119,6 +124,8 @@ If you find this work useful, please cite:
   title     = {REAL: Efficient Distributed Training of Dynamic GNNs with
                Reuse-Aware Load Balancing Scheduling},
   author    = {Fan, Zihao and Liu, Yunzhuo and Guo, Tian and Jiang, Bo},
+  booktitle = {Proceedings of the International Conference for High Performance
+               Computing, Networking, Storage, and Analysis (SC '26)},
   year      = {2026}
 }
 ```
