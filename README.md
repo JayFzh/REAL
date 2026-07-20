@@ -1,6 +1,4 @@
-# REAL
-
-**Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load-Balancing Scheduling**
+# REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load-Balancing Scheduling
 
 > Official implementation of our **SC '26** paper, *REAL: Efficient Distributed
 > Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling*
