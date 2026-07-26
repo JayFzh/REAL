@@ -1,5 +1,9 @@
 # REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load-Balancing Scheduling
 
+*Reuse-aware distributed training for dynamic graph neural networks: incremental
+DGL kernels skip computation that is unchanged between snapshots, and ILP /
+greedy schedulers place snapshot groups on GPUs to balance both reuse and load.*
+
 > Official implementation of our **SC '26** paper, *REAL: Efficient Distributed
 > Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling*
 > (to appear in the ACM/IEEE International Conference for High Performance
