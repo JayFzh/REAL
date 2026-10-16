@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling · SC ’26</title>
+  <meta name="description" content="REAL is a reuse-aware distributed training system for dynamic GNNs. It co-optimizes data transfer, data reuse and load balance, reaching up to 3.26× speedup over the strongest baseline on H200 GPUs. SC ’26.">
+  <meta name="theme-color" content="#c8161e">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="REAL: Efficient Distributed Training of Dynamic GNNs (SC ’26)">
+  <meta property="og:description" content="Reuse-aware load-balancing scheduling for distributed DGNN training. Up to 3.26× over the strongest baseline.">
+  <meta property="og:url" content="https://jayfzh.github.io/REAL/">
+  <meta property="og:image" content="https://jayfzh.github.io/REAL/static/img/overview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/png" href="static/img/favicon-64.png">
+  <link rel="apple-touch-icon" href="static/img/apple-touch-icon.png">
+  <link rel="preload" href="static/fonts/Cinzel-var.woff" as="font" type="font/woff" crossorigin>
+  <link rel="stylesheet" href="static/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="static/css/style.css">
+  <script defer src="static/vendor/katex/katex.min.js"></script>
+  <script defer src="static/vendor/katex/auto-render.min.js"></script>
+  <script defer src="static/js/data.js"></script>
+  <script defer src="static/js/main.js"></script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a class="nav-logo" href="#top" aria-label="REAL, back to top">
+      <picture>
+        <source srcset="static/img/sjtu-emblem-white.png" media="(prefers-color-scheme: dark)">
+        <img class="nav-emblem" src="static/img/sjtu-emblem.png" alt="" width="30" height="30">
+      </picture>
+      <span class="nav-divider" aria-hidden="true"></span>
+      <span class="nav-name">Real</span>
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#motivation">Motivation</a>
+      <a href="#design">Design</a>
+      <a href="#scheduling">Scheduling</a>
+      <a href="#results">Results</a>
+      <a href="#cite">Cite</a>
+    </nav>
+    <a class="nav-cta" href="static/pdf/REAL_SC26.pdf">Paper</a>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ================= HERO ================= -->
+  <section class="hero">
+    <div class="hero-pattern" aria-hidden="true"></div>
+    <div class="wrap hero-inner">
+      <div class="hero-top">
+        <a class="hero-logo" href="https://www.sjtu.edu.cn/" aria-label="Shanghai Jiao Tong University">
+          <img src="static/img/sjtu-logo-white.png" alt="Shanghai Jiao Tong University" width="679" height="180">
+        </a>
+        <span class="venue"><span class="venue-dot" aria-hidden="true"></span>SC ’26 · Chicago</span>
+      </div>
+
+      <h1 class="title">
+        <span class="title-name">Real</span>
+        <span class="title-sub">Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling</span>
+      </h1>
+
+      <ul class="authors">
+        <li>Zihao Fan<sup>†</sup></li>
+        <li>Yunzhuo Liu<sup>†</sup></li>
+        <li>Tian Guo<sup>‡</sup></li>
+        <li>Bo Jiang<sup>†*</sup></li>
+      </ul>
+      <ul class="affils">
+        <li><sup>†</sup>Shanghai Jiao Tong University</li>
+        <li><sup>‡</sup>Worcester Polytechnic Institute</li>
+        <li><sup>*</sup>Corresponding author</li>
+      </ul>
+
+      <div class="buttons">
+        <a class="btn btn-light" href="static/pdf/REAL_SC26.pdf">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>
+          Paper (PDF)
+        </a>
+        <a class="btn btn-ghost" href="https://github.com/JayFzh/REAL">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg>
+          Code &amp; Artifact
+        </a>
+        <a class="btn btn-ghost" href="#cite">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h4v4H7zM13 7h4v4h-4zM7 11c0 3-1 5-3 6M13 11c0 3-1 5-3 6"/></svg>
+          BibTeX
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TEASER ================= -->
+  <section class="wrap teaser">
+    <figure class="fig">
+      <div class="stamp-wrap">
+        <div class="stamp zoomable">
+          <img src="static/img/overview.png" alt="Overview of REAL: a CPU control plane with preprocessor, profiler and scheduler; a GPU data plane running HtoD, GraphConv/IncreConv and MatMul streams on every GPU." width="2600" height="930">
+        </div>
+      </div>
+      <figcaption><b>Overview of Real.</b> A CPU control plane builds difference maps, profiles costs and plans a balanced schedule (ILP <span class="sc">Real-L</span> or greedy <span class="sc">Real-G</span>). The GPU data plane runs <code>IncreConv</code> on a triple-stream pipeline.</figcaption>
+    </figure>
+
+    <div class="tldr">
+      <span class="tldr-tag">TL;DR</span>
+      <p>Snapshot groups are <em>independent</em> training samples, so they can be combined and run in any order. <span class="sc">Real</span> uses this freedom three ways. It keeps every group on one GPU, which removes neighbor-feature and hidden-state transfers. It skips work that adjacent snapshots and co-scheduled groups share. And it pairs groups across GPUs so that no GPU waits for a straggler.</p>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-label">Speedup over the strongest baseline (BLAD)</div>
+        <div class="stat-value">3.26<span class="x">×</span></div>
+        <div class="stat-note">peak, <span class="sc">Real-L</span>, 1-layer, 8 GPUs</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Average speedup over BLAD across 24 settings</div>
+        <div class="stat-value">1.83<span class="x">×</span></div>
+        <div class="stat-note"><span class="sc">Real-G</span>: 1.77×</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Fewer <code>GraphConv</code> FLOPs than DistDGL</div>
+        <div class="stat-value">11.6<span class="x">×</span></div>
+        <div class="stat-note">avg; 2.87× fewer than ESDG / BLAD</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Average speedup over DistDGL on 32 H200 GPUs</div>
+        <div class="stat-value">9.93<span class="x">×</span></div>
+        <div class="stat-note">1-layer; 12.43× for 2-layer</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ABSTRACT ================= -->
+  <section class="wrap section" id="abstract">
+    <header class="sec-head">
+      <div>
+        <p class="sec-en">Overview</p>
+        <h2>Abstract</h2>
+      </div>
+    </header>
+    <div class="abstract">
+      <p>Dynamic Graph Neural Networks (DGNNs) enable learning from evolving graphs by capturing both structural and temporal dependencies. However, training DGNNs at scale is challenging due to three conflicting requirements: maximizing resource utilization, minimizing data transfers, and maximizing data reuse. Existing systems typically optimize one objective at the expense of the others, leading to communication bottlenecks, load imbalance, or redundant computation.</p>
+      <p>We present <span class="sc">Real</span>, a reuse-aware distributed system for DGNN training that jointly addresses these challenges. <span class="sc">Real</span> minimizes data transfers via snapshot-group scheduling, and leverages an incremental aggregation mechanism to decouple computation from structural updates, effectively pruning redundant I/O and FLOPs via snapshot- and group-level reuse. We further design two complementary schedulers: <span class="sc">Real-L</span>, an ILP-based optimizer for globally optimal planning, and <span class="sc">Real-G</span>, a scalable greedy heuristic. Experiments on six dynamic graph datasets and four DGNN models show that <span class="sc">Real-L</span> and <span class="sc">Real-G</span> achieve 1.11×–3.26× and 1.10×–3.16× speedup over the strongest baseline.</p>
+    </div>
+  </section>
+
+  <!-- ================= MOTIVATION ================= -->
+  <section class="band" id="motivation">
+    <div class="wrap section">
+      <header class="sec-head">
+        <span class="sec-no" aria-hidden="true">01</span>
+        <div>
+          <p class="sec-en">Motivation</p>
+          <h2>A trilemma no existing system resolves</h2>
+        </div>
+      </header>
+      <p class="lead">Distributed DGNN training has to keep every GPU busy, move as little data as possible (both across GPUs and over PCIe), and reuse as much work as possible between nearly identical snapshots. These goals conflict. Fine-grained partitioning balances load but multiplies transfers, and enforcing reuse makes it harder to spread work evenly.</p>
+
+      <div class="split">
+        <figure class="fig zoomable fig-workflow">
+          <img src="static/img/workflow.png" alt="Workflow of distributed DGNN training: snapshot groups, spatial aggregation with neighbor feature transfer, temporal evolution with hidden state transfer, and gradient AllReduce." width="1600" height="1725" loading="lazy">
+          <figcaption>Fig. 1 · Workflow of distributed DGNN training.</figcaption>
+        </figure>
+        <div class="prose">
+          <h3 class="h3">Where the time goes</h3>
+          <p>A DGNN layer first runs <b>spatial aggregation</b> over each snapshot (a GNN such as GCN or GAT), then <b>temporal evolution</b> (an RNN such as LSTM or GRU) that carries a hidden state from snapshot to snapshot. Sequences of snapshots are cut into <em>snapshot groups</em>, the basic training unit.</p>
+          <ol class="steps">
+            <li><span class="step-no">1</span><div><b>Neighbor-feature transfer.</b> When a snapshot is partitioned, boundary nodes must fetch neighbor features from remote GPUs before aggregation can start.</div></li>
+            <li><span class="step-no">2</span><div><b>Hidden-state transfer.</b> When consecutive snapshots sit on different GPUs, the RNN needs \(h_{t-1}\) from another device, which is a strict sequential barrier.</div></li>
+            <li><span class="step-no">3</span><div><b>Gradient AllReduce.</b> Parameters are synchronized after every backward pass. This is the only transfer <span class="sc">Real</span> keeps.</div></li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="cmp">
+        <h3 class="h3">How existing systems compare</h3>
+        <p class="swipe-hint" aria-hidden="true">Swipe the table sideways to see all systems →</p>
+        <div class="table-scroll">
+          <table class="cmp-table">
+            <caption>Table I · Comparison of existing solutions on data transfer, resource utilization and data reuse.</caption>
+            <thead>
+              <tr><th scope="col">Category</th><th scope="col">Dimension</th><th scope="col">AliGraph</th><th scope="col">DistDGL</th><th scope="col">ESDG</th><th scope="col">DGC</th><th scope="col">BLAD</th><th scope="col">DynaHB</th><th scope="col" class="us">Real</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row" rowspan="3">Data transfer</th><td class="dim">No neighbor-feature transfer</td><td class="n">✕</td><td class="n">✕</td><td class="y">✓</td><td class="n">✕</td><td class="y">✓</td><td class="y">✓</td><td class="y us">✓</td></tr>
+              <tr><td class="dim">No hidden-state transfer</td><td class="y">✓</td><td class="y">✓</td><td class="n">✕</td><td class="n">✕</td><td class="y">✓</td><td class="y">✓</td><td class="y us">✓</td></tr>
+              <tr><td class="dim">No extra CPU–GPU transfer</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">✕</td><td class="y us">✓</td></tr>
+              <tr class="grp"><th scope="row" rowspan="2">Resource util.</th><td class="dim">Resource-level parallelism</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="y">✓</td><td class="n">✕</td><td class="y us">✓</td></tr>
+              <tr><td class="dim">Load balance</td><td class="y">✓</td><td class="y">✓</td><td class="n">✕</td><td class="y">✓</td><td class="n">✕</td><td class="y">✓</td><td class="y us">✓</td></tr>
+              <tr class="grp"><th scope="row">Data reuse</th><td class="dim">Topology-aware reuse</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="n">✕</td><td class="y us">✓</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="insights" data-tabs>
+        <div class="tablist" role="tablist" aria-label="Limitations of existing approaches">
+          <button class="tab" role="tab" id="tab-xfer" aria-controls="panel-xfer" data-tab="xfer" aria-selected="true"><span class="tab-num">a</span>Transfer-bound partitioning</button>
+          <button class="tab" role="tab" id="tab-idle" aria-controls="panel-idle" data-tab="idle"><span class="tab-num">b</span>Idle GPUs &amp; imbalance</button>
+          <button class="tab" role="tab" id="tab-reuse" aria-controls="panel-reuse" data-tab="reuse"><span class="tab-num">c</span>Reuse that fades</button>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-xfer" aria-labelledby="tab-xfer" data-panel="xfer">
+          <div class="panel-text">
+            <h3>Partitioning snapshots costs transfers</h3>
+            <p><b>Vertex-based</b> partitioning (DistDGL) balances load by spreading nodes, but fragments every snapshot, so neighbor features cross GPUs at every message-passing step.</p>
+            <p><b>Snapshot-based</b> partitioning (ESDG) keeps aggregation local, but ships hidden states between GPUs, and the RNN's sequential dependency leaves GPUs idling while they wait.</p>
+            <p class="insight">Profiling WD-GCN on three real datasets: inter-GPU transfer takes <b>34%</b> of forward time for DistDGL, and <b>81%</b> for ESDG (including idle time).</p>
+          </div>
+          <figure class="fig zoomable">
+            <img src="static/img/inter_gpu_time.png" alt="Inter-GPU data transfer time during the forward pass for DistDGL and ESDG on three datasets." width="1800" height="888" loading="lazy">
+            <figcaption>Fig. 2 · Inter-GPU transfer time in the forward pass, DistDGL vs. ESDG.</figcaption>
+          </figure>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-idle" aria-labelledby="tab-idle" data-panel="idle" hidden>
+          <div class="panel-text">
+            <h3>Locality alone leaves GPUs unevenly loaded</h3>
+            <p><b>Group-based</b> partitioning (BLAD) processes each snapshot group on a single GPU, which removes both neighbor-feature and hidden-state transfers.</p>
+            <p>But variations in graph size and structure <em>accumulate</em> inside a group. Some GPUs finish early and sit idle until the slowest one is done.</p>
+            <p class="insight">On Stackoverflow, ESDG under-utilizes all GPUs, while BLAD shows uneven utilization caused by load imbalance.</p>
+          </div>
+          <figure class="fig zoomable">
+            <img src="static/img/gpu_util_motiv.png" alt="GPU utilization over time for ESDG and BLAD on the Stackoverflow dataset." width="2550" height="672" loading="lazy">
+            <figcaption>Fig. 4 · GPU utilization of ESDG and BLAD on Stackoverflow.</figcaption>
+          </figure>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-reuse" aria-labelledby="tab-reuse" data-panel="reuse" hidden>
+          <div class="panel-text">
+            <h3>Existing reuse doesn't scale or generalize</h3>
+            <p>Adjacent snapshots share most of their topology, yet distributed systems redo full <code>GraphConv</code> on every one. Single-GPU PiPAD reuses the <em>global</em> intersection of all snapshots, but that intersection shrinks fast. reINC prunes work incrementally but ignores load balance.</p>
+            <p>Neither handles attention-based GNNs: GAT's softmax couples every neighbor of a node, so it can't be maintained from incremental changes alone.</p>
+            <p class="insight">With a fixed 5–15% edge change rate, the global intersection drops <b>below 20%</b> after 30 snapshots.</p>
+          </div>
+          <figure class="fig zoomable fig-sm">
+            <img src="static/img/overlap_ratio.png" alt="Topology overlap ratio versus number of snapshots for edge change rates of 5, 10 and 15 percent." width="1800" height="982" loading="lazy">
+            <figcaption>Fig. 3 · Effect of change rate and snapshot count on topology overlap.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DESIGN ================= -->
+  <section class="wrap section" id="design">
+    <header class="sec-head">
+      <span class="sec-no" aria-hidden="true">02</span>
+      <div>
+        <p class="sec-en">System design</p>
+        <h2>Groups as the unit, reuse at two levels</h2>
+      </div>
+    </header>
+    <p class="lead">The key insight is that <b>different snapshot groups are independent samples</b> in DGNN training. They can be combined freely and scheduled in any order. <span class="sc">Real</span> builds on this in three ways.</p>
+
+    <div class="principles">
+      <div class="principle">
+        <span class="p-no">I</span>
+        <h3>Minimize data transfer</h3>
+        <p>Snapshot-group partitioning confines cross-GPU traffic to gradient synchronization. Reusable structures cut redundant CPU→GPU copies.</p>
+      </div>
+      <div class="principle">
+        <span class="p-no">II</span>
+        <h3>Maximize data reuse</h3>
+        <p>Topology similarity is exploited both <em>between adjacent snapshots</em> (Type I) and <em>between co-scheduled groups</em> (Type II).</p>
+      </div>
+      <div class="principle">
+        <span class="p-no">III</span>
+        <h3>Maximize utilization</h3>
+        <p>A triple-stream pipeline overlaps heterogeneous operators, and cross-group scheduling balances load across GPUs.</p>
+      </div>
+    </div>
+
+    <div class="arch">
+      <div class="arch-plane">
+        <span class="plane-tag">Control plane · CPU</span>
+        <div class="component"><span class="chip">Preprocessor</span><div>Diffs each snapshot \(\mathcal{G}_i\) against \(\mathcal{G}_{i-1}\) into a sparse difference map (<code>dmap</code>). Degree–runtime cost curves, fitted once on synthetic graphs, then pick a full graph or its <code>dmap</code> for each snapshot, e.g. \([\mathcal{G}_i, \texttt{dmap}_{i+1}, \mathcal{G}_{i+2}, \texttt{dmap}_{i+3}]\).</div></div>
+        <div class="component"><span class="chip">Profiler</span><div>Measures <code>HtoD</code>, <code>Conv</code>, <code>MatMul</code>, RNN and backward time over several epochs, dropping outliers. Estimates the reuse saving \(\mathcal{R}_{i,j}\) when groups \(i\) and \(j\) share a GPU.</div></div>
+        <div class="component"><span class="chip">Scheduler</span><div>Simulates epoch time from the profile and solves for a balanced, reuse-maximizing assignment. It tries ILP first and falls back to greedy on timeout.</div></div>
+      </div>
+      <div class="arch-plane plane-data">
+        <span class="plane-tag">Data plane · GPU</span>
+        <div class="component"><span class="chip">Training</span><div>Every GPU trains its assigned groups locally with <code>IncreConv</code> and selective <code>MatMul</code>, overlapped on three CUDA streams.</div></div>
+        <div class="component"><span class="chip">Co-location</span><div>Groups placed on the same GPU in one iteration keep their shared snapshots resident in GPU memory (Type II reuse).</div></div>
+        <div class="component"><span class="chip">Sync</span><div>One gradient AllReduce per iteration is the only cross-GPU traffic. The iteration ends when the slowest GPU finishes.</div></div>
+      </div>
+    </div>
+
+    <!-- Type I -->
+    <div class="subsection" id="type1">
+      <h3 class="h3"><span class="kicker">Type I</span> Snapshot-level reuse</h3>
+      <p class="sub-lead">Consecutive snapshots are nearly identical. If a node's neighborhood didn't change, its aggregated feature didn't either, and multiplying it by the same weights again is wasted work. <span class="sc">Real</span> decouples aggregation from transformation in <code>GraphConv</code> and reuses both at the first GNN layer, where input features are time-invariant within a group.</p>
+      <figure class="fig zoomable fig-wide">
+        <img src="static/img/snapshot_reuse.png" alt="Snapshot-level data reuse: decoupling GraphConv into aggregation and MatMul, replacing later GraphConvs with IncreConv on difference maps, MatMul on unique changed nodes, and a triple-stream pipeline overlapping HtoD, Conv and MatMul." width="2600" height="593" loading="lazy">
+        <figcaption>Fig. 6 · Snapshot-level data reuse (GCN with aggregation before transformation).</figcaption>
+      </figure>
+
+      <div class="eq-grid">
+        <div class="eq-card">
+          <span class="eq-label">IncreConv</span>
+          <p>The <code>dmap</code> marks each edge as added (+1), removed (−1) or unchanged (0). Only changed edges contribute, on top of the cached aggregation that the RNN already keeps.</p>
+          <div class="eq">$$h_j^{(t)} = h_j^{(t-1)} + \sum_{i \in \Delta\mathcal{E}_j} \texttt{dmap}(i,j)\, w_{ij}\, h_i$$</div>
+          <div class="complexity"><span class="old">\(O(|\mathcal{E}|)\)</span><span class="arrow">→</span><span class="new">\(O(|\Delta\mathcal{E}|)\)</span><span class="muted-inline">per snapshot</span></div>
+        </div>
+        <div class="eq-card">
+          <span class="eq-label">Degree-aware · GCN</span>
+          <p>GCN weights need full-snapshot degrees. Each <code>dmap</code> node carries its degree in both snapshots, so no global edge-weight table is needed.</p>
+          <div class="eq">$$w_{ij} = \begin{cases} +\dfrac{1}{\sqrt{d_i^{(t)} d_j^{(t)}}} & \texttt{dmap}(i,j) = +1 \\[8pt] -\dfrac{1}{\sqrt{d_i^{(t-1)} d_j^{(t-1)}}} & \texttt{dmap}(i,j) = -1 \end{cases}$$</div>
+        </div>
+        <div class="eq-card">
+          <span class="eq-label">Softmax-aware · GAT</span>
+          <p>A single edge change alters the softmax denominator shared by all neighbors. <span class="sc">Real</span> caches \(\mathcal{D}_j\), updates it, and rescales the old aggregate in \(O(1)\).</p>
+          <div class="eq">$$\mathcal{D}_j^{(t)} = \mathcal{D}_j^{(t-1)} + \sum_{i \in \Delta\mathcal{E}_j} \texttt{dmap}(i,j)\, e^{e_{ij}^{(t)}}$$</div>
+          <div class="eq">$$h_j^{(t)} = h_j^{(t-1)} \frac{\mathcal{D}_j^{(t-1)}}{\mathcal{D}_j^{(t)}} + \sum_{i \in \Delta\mathcal{E}_j} \texttt{dmap}(i,j) \frac{e^{e_{ij}^{(t)}}}{\mathcal{D}_j^{(t)}} \mathcal{W} h_i$$</div>
+        </div>
+      </div>
+
+      <div class="two-col reuse-cards">
+        <div class="card">
+          <h4>Transformation reuse</h4>
+          <p><b>Pre-aggregation</b> (e.g. GAT): input features are time-invariant inside a group, so the projection is computed once and shared by all snapshots.</p>
+          <p><b>Post-aggregation</b> (e.g. GCN): <em>selective</em> <code>MatMul</code>. Only nodes whose neighborhoods changed (found via <code>dmap</code>) are re-multiplied; the rest reuse cached results.</p>
+        </div>
+        <div class="card">
+          <h4>Triple-stream pipeline</h4>
+          <p>Three CUDA streams stress three different resources, so they overlap across snapshots and are kept consistent with <code>cudaEvent</code>s:</p>
+          <ul class="streams">
+            <li><span class="stream s-htod">HtoD</span>PCIe bandwidth</li>
+            <li><span class="stream s-conv">Conv</span>HBM bandwidth</li>
+            <li><span class="stream s-mm">MatMul</span>SM TFLOPS</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- Type II -->
+    <div class="subsection" id="type2">
+      <h3 class="h3"><span class="kicker">Type II</span> Group-level reuse</h3>
+      <p class="sub-lead">Model parameters are frozen within an iteration. When two groups that share snapshots run on the same GPU in the same iteration, the shared snapshots stay resident: their <code>HtoD</code> copies and <code>GraphConv</code> are done once. The scheduler therefore reorders execution to chain overlapping groups instead of following a naive disjoint order.</p>
+      <div class="chain" role="img" aria-label="Naive pairing loads G1, G2, G3, G4 for two disjoint groups; similarity-aware pairing of [G1,G2] with [G2,G3] loads only G1, G2, G3 because G2 is shared.">
+        <div class="chain-row">
+          <span class="chain-label">Naive order</span>
+          <div class="chain-groups">
+            <span class="grp-box"><span class="snap">G<sub>1</sub></span><span class="snap">G<sub>2</sub></span></span>
+            <span class="plus">+</span>
+            <span class="grp-box"><span class="snap">G<sub>3</sub></span><span class="snap">G<sub>4</sub></span></span>
+          </div>
+          <span class="chain-cost">4 × HtoD · 4 × GraphConv</span>
+        </div>
+        <div class="chain-row on">
+          <span class="chain-label">Similarity-aware</span>
+          <div class="chain-groups">
+            <span class="grp-box"><span class="snap">G<sub>1</sub></span><span class="snap shared">G<sub>2</sub></span></span>
+            <span class="plus">+</span>
+            <span class="grp-box"><span class="snap shared">G<sub>2</sub></span><span class="snap">G<sub>3</sub></span></span>
+          </div>
+          <span class="chain-cost">3 × HtoD · 3 × GraphConv</span>
+        </div>
+        <p class="chain-note"><span class="snap shared mini">G<sub>2</sub></span> is loaded and convolved once and reused by both groups. Unlike Type I, this saving doesn't depend on the edge change rate, because whole snapshots are shared.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCHEDULING ================= -->
+  <section class="band" id="scheduling">
+    <div class="wrap section">
+      <header class="sec-head">
+        <span class="sec-no" aria-hidden="true">03</span>
+        <div>
+          <p class="sec-en">Cross-group scheduling</p>
+          <h2>Balance load without giving up reuse</h2>
+        </div>
+      </header>
+      <p class="lead">Given groups with standalone times \(t_k\), \(D\) GPUs and pairwise reuse savings \(\mathcal{R}_{k_1,k_2}\), <span class="sc">Real</span> chooses which groups share a GPU in each iteration (at most \(L = 2\) per GPU, bounded by memory and solver cost). The goal is to minimize the epoch time \(T = \sum_i T_i\).</p>
+
+      <div class="obj">
+        <div class="eq-card">
+          <span class="eq-label">GPU load in iteration \(i\)</span>
+          <div class="eq">$$\mathcal{L}_{i,j} = \sum_{k} t_k\, x_{k,i,j} \;-\; \sum_{k_1 < k_2} \mathcal{R}_{k_1,k_2}\, \mathbb{I}\!\left(x_{k_1,i,j} = 1 \wedge x_{k_2,i,j} = 1\right)$$</div>
+          <p>Base compute minus the reuse benefit of co-located groups; \(x_{k,i,j} = 1\) puts group \(k\) on GPU \(j\) in iteration \(i\).</p>
+        </div>
+        <div class="eq-card">
+          <span class="eq-label">Iteration makespan</span>
+          <div class="eq">$$T_i = \max_{j \in \mathcal{D}} \mathcal{L}_{i,j} + \alpha$$</div>
+          <p>The slowest GPU plus synchronization overhead \(\alpha\). This generalizes makespan minimization on parallel machines, so the problem is NP-hard.</p>
+        </div>
+      </div>
+
+      <div class="two-col solvers">
+        <div class="card solver">
+          <div class="solver-head"><span class="solver-name sc">Real-L</span><span class="solver-kind">ILP · Gurobi</span></div>
+          <p>Globally optimizes the whole epoch's schedule. The nonlinear pieces are linearized:</p>
+          <ul class="ticks">
+            <li><b>Assignment &amp; capacity:</b> each group is scheduled exactly once, \(\sum_k x_{k,i,j} \le L\).</li>
+            <li><b>McCormick envelopes</b> replace the logical AND with \(y_{k_1,k_2,i,j}\): \(y \le x_{k_1}\), \(y \le x_{k_2}\), \(y \ge x_{k_1} + x_{k_2} - 1\).</li>
+            <li><b>Epigraph min-max</b> instead of Big-M: \(T_i \ge \mathcal{L}_{i,j} + \alpha\) for every \(j\), a tighter relaxation.</li>
+          </ul>
+          <p class="muted">Stops at a preset optimality gap (e.g. 10%).</p>
+        </div>
+        <div class="card solver">
+          <div class="solver-head"><span class="solver-name sc">Real-G</span><span class="solver-kind">Greedy · \(O(n^3)\)</span></div>
+          <p>A scalable heuristic that builds one iteration at a time and minimizes wasted GPU time (bubbles):</p>
+          <ul class="ticks">
+            <li>Add a <b>zero group</b> \(t_0 = 0\) so any group may run alone, then sort by time.</li>
+            <li>Pair the longest group with every other group to get <b>candidate makespans</b> \(\mathcal{T}\).</li>
+            <li>For each \(\mathcal{T}\), a <b>two-pointer search</b> picks the \(D - 1\) pairs closest to it; keep the plan with the least waste.</li>
+          </ul>
+          <div class="eq">$$W_i = D \cdot (T_i - \alpha) - \sum_{j \in \mathcal{D}} \mathcal{L}_{i,j}$$</div>
+          <p class="muted">A few seconds even at \(n \sim 10^3\) groups.</p>
+        </div>
+      </div>
+
+      <div class="fallback" aria-label="Scheduling strategy selection">
+        <div class="fb-step"><span class="fb-k">1</span><div><b>Profile</b><p class="fb-desc">estimate \(T_{\text{epoch}}\)</p></div></div>
+        <span class="fb-arrow" aria-hidden="true"></span>
+        <div class="fb-step"><span class="fb-k">2</span><div><b>Try <span class="sc">Real-L</span></b><p class="fb-desc">time limit \(\tau = 2 \times T_{\text{epoch}}\)</p></div></div>
+        <span class="fb-arrow" aria-hidden="true"></span>
+        <div class="fb-step"><span class="fb-k">3</span><div><b>Fall back to <span class="sc">Real-G</span></b><p class="fb-desc">if no feasible ILP plan in time</p></div></div>
+      </div>
+      <p class="fine fb-note">Bounding the solver by \(\tau\) caps scheduling overhead while letting as many epochs as possible run an optimized plan.</p>
+    </div>
+  </section>
+
+  <!-- ================= RESULTS ================= -->
+  <section class="wrap section" id="results">
+    <header class="sec-head">
+      <span class="sec-no" aria-hidden="true">04</span>
+      <div>
+        <p class="sec-en">Evaluation</p>
+        <h2>Faster on every model and dataset</h2>
+      </div>
+    </header>
+
+    <div class="setup">
+      <div class="kpi"><span class="kpi-v">4 × 8 H200</span><span class="kpi-l">141 GB HBM3e each; NVLink 900 GB/s within a server</span></div>
+      <div class="kpi"><span class="kpi-v">3.2 Tbps</span><span class="kpi-l">RoCE per server (8 × ConnectX-7) across servers</span></div>
+      <div class="kpi"><span class="kpi-v">6 × 4</span><span class="kpi-l">datasets × models: EvolveGCN, WD-GCN, TGCN, GAT-LSTM</span></div>
+      <div class="kpi"><span class="kpi-v">3 baselines</span><span class="kpi-l">ESDG, DistDGL, BLAD · DGL 2.4, PyTorch 2.4, CUDA 12.5</span></div>
+    </div>
+
+    <details class="datasets">
+      <summary>Datasets (Table II)</summary>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead><tr><th scope="col">Dataset</th><th scope="col">\(\overline{|\mathcal{V}|}\)</th><th scope="col">\(\overline{|\mathcal{E}|}\)</th><th scope="col">\(\overline{|\mathcal{V}_d|}\)</th><th scope="col">\(\overline{|\mathcal{E}_d|}\)</th><th scope="col">\(d_v\)</th><th scope="col">\(\beta\)</th><th scope="col">\(\gamma\)</th></tr></thead>
+          <tbody>
+            <tr><td>Arxiv</td><td>169.3k</td><td>1.8M</td><td>88.7k</td><td>242.6k</td><td>128</td><td>10.6</td><td>100</td></tr>
+            <tr><td>Products</td><td>2.4M</td><td>36.7M</td><td>1.5M</td><td>5.9M</td><td>100</td><td>15.0</td><td>100</td></tr>
+            <tr><td>Reddit</td><td>232.9k</td><td>31.9M</td><td>211.6k</td><td>5.5M</td><td>602</td><td>137.3</td><td>100</td></tr>
+            <tr><td>Stackoverflow</td><td>2.6M</td><td>23.1M</td><td>790.3k</td><td>3.1M</td><td>128</td><td>8.9</td><td>100</td></tr>
+            <tr><td>Stackoverflow-a2q</td><td>2.5M</td><td>10.8M</td><td>554.3k</td><td>1.5M</td><td>128</td><td>4.4</td><td>100</td></tr>
+            <tr><td>Wiki-talk</td><td>1.1M</td><td>6.3M</td><td>182.8k</td><td>439.4k</td><td>128</td><td>5.5</td><td>100</td></tr>
+            <tr class="grp"><td>Arxiv†</td><td>169.3k</td><td>1.8M</td><td>89.3k</td><td>245.9k</td><td>128</td><td>10.6</td><td>300</td></tr>
+            <tr><td>Products†</td><td>2.2M</td><td>18.6M</td><td>1.6M</td><td>3.6M</td><td>100</td><td>7.6</td><td>300</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="fine">Per-snapshot averages of nodes and edges, the same per <code>dmap</code>, feature dimension \(d_v\), average degree \(\beta\) and snapshot count \(\gamma\). Arxiv, Products and Reddit are made dynamic by randomly changing edges, following BLAD. The snapshot group size is 4 and the hidden dimension 64 for all runs.</p>
+    </details>
+
+    <!-- Explorer -->
+    <div class="result-block">
+      <div class="result-head">
+        <h3 class="h3">Speedup explorer</h3>
+        <span class="muted">Measured results from Figs. 7–8, re-normalized to the baseline you pick</span>
+      </div>
+      <div class="explorer" id="explorer">
+        <div class="ex-controls">
+          <div class="control">
+            <span class="control-label" id="lb-scale">Cluster</span>
+            <div class="seg" role="group" aria-labelledby="lb-scale" data-key="scale">
+              <button type="button" data-v="g8" class="on">8 GPUs · 1 server</button>
+              <button type="button" data-v="g32">32 GPUs · 4 servers</button>
+            </div>
+          </div>
+          <div class="control">
+            <span class="control-label" id="lb-depth">Model depth</span>
+            <div class="seg" role="group" aria-labelledby="lb-depth" data-key="depth">
+              <button type="button" data-v="l1" class="on">1 layer</button>
+              <button type="button" data-v="l2">2 layers</button>
+            </div>
+          </div>
+          <div class="control">
+            <span class="control-label" id="lb-base">Compare against</span>
+            <div class="seg" role="group" aria-labelledby="lb-base" data-key="base">
+              <button type="button" data-v="0">ESDG</button>
+              <button type="button" data-v="1">DistDGL</button>
+              <button type="button" data-v="2" class="on">BLAD</button>
+            </div>
+          </div>
+          <div class="control">
+            <span class="control-label" id="lb-ours">Scheduler</span>
+            <div class="seg" role="group" aria-labelledby="lb-ours" data-key="ours">
+              <button type="button" data-v="4" class="on sc">Real-L</button>
+              <button type="button" data-v="3" class="sc">Real-G</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="readout" id="ex-readout" aria-live="polite"></div>
+
+        <div class="ex-body">
+          <div class="ex-heat">
+            <div class="viz-title" id="heat-title"></div>
+            <div class="heat" id="heat"></div>
+            <div class="heat-legend" id="heat-legend" aria-hidden="true"></div>
+          </div>
+          <div class="ex-detail">
+            <div class="viz-title" id="detail-title"></div>
+            <div class="viz" id="detail"></div>
+            <p class="detail-note" id="detail-note"></p>
+          </div>
+        </div>
+
+        <details class="table-view">
+          <summary>Table view</summary>
+          <div class="table-scroll"><table id="ex-table"></table></div>
+        </details>
+        <p class="fine">Values were read from the vector bars of the paper's Figs. 7–8, where they are normalized to ESDG. They reproduce the ranges and averages quoted in the paper to within ±0.02. EG/WG/TG/GL = EvolveGCN / WD-GCN / TGCN / GAT-LSTM. † = 300-snapshot variants used for the 32-GPU runs.</p>
+        <div class="viz-tooltip" id="ex-tooltip" hidden></div>
+      </div>
+    </div>
+
+    <div class="result-block" data-tabs>
+      <div class="result-head">
+        <h3 class="h3">The paper's figures</h3>
+        <div class="seg" role="tablist" aria-label="Speedup figure">
+          <button class="tab" role="tab" data-tab="f8a" aria-selected="true">8 GPUs · 1-layer</button>
+          <button class="tab" role="tab" data-tab="f8b">8 GPUs · 2-layer</button>
+          <button class="tab" role="tab" data-tab="f32a">32 GPUs · 1-layer</button>
+          <button class="tab" role="tab" data-tab="f32b">32 GPUs · 2-layer</button>
+        </div>
+      </div>
+      <div class="fig-panels">
+        <figure class="fig zoomable" data-panel="f8a">
+          <img src="static/img/speedup_g8_l1.png" alt="Training speedup normalized to ESDG for one-layer models on 8 GPUs across six datasets." width="2600" height="402" loading="lazy">
+          <figcaption>Fig. 7a · One-layer DGNNs on one server (8 GPUs), normalized to ESDG. <span class="sc">Real-L</span>: 3.14×–8.56× over ESDG, 2.26×–7.76× over DistDGL, 1.11×–3.26× over BLAD.</figcaption>
+        </figure>
+        <figure class="fig zoomable" data-panel="f8b" hidden>
+          <img src="static/img/speedup_g8_l2.png" alt="Training speedup normalized to ESDG for two-layer models on 8 GPUs across six datasets; BLAD runs out of memory in some cases." width="2600" height="402" loading="lazy">
+          <figcaption>Fig. 7b · Two-layer DGNNs on 8 GPUs. Gains over BLAD narrow (avg 1.39×) because only the first layer benefits from reuse; BLAD's two-group pipeline runs out of memory on large graphs.</figcaption>
+        </figure>
+        <figure class="fig zoomable fig-narrow" data-panel="f32a" hidden>
+          <img src="static/img/speedup_g32_l1.png" alt="Training speedup normalized to ESDG for one-layer models on 32 GPUs on Arxiv and Products variants." width="2758" height="1072" loading="lazy">
+          <figcaption>Fig. 8a · One-layer DGNNs on four servers (32 GPUs). Vertex partitioning now pays for cross-server neighbor aggregation, so <span class="sc">Real-L</span> averages 9.93× over DistDGL.</figcaption>
+        </figure>
+        <figure class="fig zoomable fig-narrow" data-panel="f32b" hidden>
+          <img src="static/img/speedup_g32_l2.png" alt="Training speedup normalized to ESDG for two-layer models on 32 GPUs on Arxiv and Products variants." width="2758" height="1072" loading="lazy">
+          <figcaption>Fig. 8b · Two-layer DGNNs on 32 GPUs: 12.43× average over DistDGL.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="result-block">
+      <div class="result-head"><h3 class="h3">Where the savings come from</h3></div>
+      <div class="two-col">
+        <div class="card">
+          <h4>Data transfer, broken down</h4>
+          <p>ESDG is dominated by hidden-state transfer and DistDGL by neighbor aggregation (worst on Reddit: degree 137, 602-d features). BLAD avoids both but still copies full graphs over PCIe. <span class="sc">Real</span> also avoids both and shrinks <code>HtoD</code> volume with <code>dmap</code>-based reuse.</p>
+          <figure class="fig zoomable"><img src="static/img/transfer.png" alt="Breakdown of per-epoch data transfer time into CPU-GPU transfer, inter-GPU communication and intra-GPU transfer for each system." width="2600" height="398" loading="lazy"><figcaption>Fig. 9 · Per-epoch data-transfer time breakdown (8 GPUs).</figcaption></figure>
+        </div>
+        <div class="card">
+          <h4>Redundant FLOPs, pruned</h4>
+          <p>Computation is limited to incremental updates. <span class="sc">Real-L</span> needs <b>3.87×–20.80×</b> (avg 11.64×) fewer <code>GraphConv</code> FLOPs than DistDGL, and <b>1.22×–5.74×</b> (avg 2.87×) fewer than ESDG and BLAD, which convolve every full snapshot.</p>
+          <figure class="fig zoomable"><img src="static/img/flops.png" alt="GraphConv FLOPs per epoch normalized to REAL-L for each system, model and dataset." width="2600" height="425" loading="lazy"><figcaption>Fig. 10 · <code>GraphConv</code> FLOPs, normalized to <span class="sc">Real-L</span>.</figcaption></figure>
+        </div>
+      </div>
+    </div>
+
+    <div class="result-block">
+      <div class="result-head">
+        <h3 class="h3">Ablation: every component pays off</h3>
+        <span class="muted">Cumulative speedup over PSG (one group per GPU per iteration, no reuse, no balancing)</span>
+      </div>
+      <div class="ablation" role="img" aria-label="Range of cumulative speedups over PSG: PSG 1.00; plus Type I reuse 1.04 to 2.05; plus Type II reuse 1.05 to 2.52; REAL-G 1.06 to 2.73; REAL-L 1.08 to 2.81.">
+        <div class="abl-axis" aria-hidden="true"><span style="--p:0">1.0×</span><span style="--p:.25">1.5×</span><span style="--p:.5">2.0×</span><span style="--p:.75">2.5×</span><span style="--p:1">3.0×</span></div>
+        <div class="abl-row"><span class="abl-name">PSG</span><div class="abl-track"><span class="abl-dot" style="--a:0"></span></div><span class="abl-val">1.00×</span></div>
+        <div class="abl-row"><span class="abl-name">+ Type I reuse</span><div class="abl-track"><span class="abl-bar" style="--a:.02;--b:.525"></span></div><span class="abl-val">1.04–2.05×</span></div>
+        <div class="abl-row"><span class="abl-name">+ Type II reuse</span><div class="abl-track"><span class="abl-bar" style="--a:.025;--b:.76"></span></div><span class="abl-val">1.05–2.52×</span></div>
+        <div class="abl-row"><span class="abl-name">+ <span class="sc">Real-G</span> scheduler</span><div class="abl-track"><span class="abl-bar" style="--a:.03;--b:.865"></span></div><span class="abl-val">1.06–2.73×</span></div>
+        <div class="abl-row us"><span class="abl-name"><span class="sc">Real-L</span> (ILP)</span><div class="abl-track"><span class="abl-bar" style="--a:.04;--b:.905"></span></div><span class="abl-val">1.08–2.81×</span></div>
+      </div>
+      <p class="caption">Each bar spans the minimum to maximum speedup across models and datasets. Type II pairs consecutive groups by default, which can unbalance load; the cross-group scheduler restores balance and keeps the reuse. ILP's whole-epoch view adds the last step.</p>
+      <figure class="fig zoomable fig-wide"><img src="static/img/ablation.png" alt="Speedup ablation normalized to PSG for each model and dataset." width="2600" height="348" loading="lazy"><figcaption>Fig. 11 · Speedup ablation across models and datasets (normalized to PSG).</figcaption></figure>
+    </div>
+
+    <div class="result-block">
+      <div class="two-col">
+        <div class="card">
+          <h4>Balanced, busy GPUs</h4>
+          <p>Over the first 30 s of training, <span class="sc">Real-L</span> keeps utilization high on all GPUs. The triple-stream pipeline hides data movement, and cross-group scheduling evens out the per-GPU load.</p>
+          <figure class="fig zoomable"><img src="static/img/util_heatmap.png" alt="GPU utilization heatmaps of REAL-L across models and datasets, showing uniformly high utilization." width="2600" height="789" loading="lazy"><figcaption>Fig. 12 · GPU utilization heatmaps of <span class="sc">Real-L</span>.</figcaption></figure>
+        </div>
+        <div class="card">
+          <h4>Same accuracy, same convergence</h4>
+          <p>Pairing two groups per GPU doubles the effective batch (\(K = 2\)), so the learning rate is scaled up proportionally. Under \(L\)-smoothness and bounded variance, gradient variance shrinks by \(\tfrac{1}{NK}\) and training converges at the standard \(\mathcal{O}(1/\sqrt{T})\) rate.</p>
+          <figure class="fig zoomable"><img src="static/img/acc_loss.png" alt="Training accuracy and loss curves on Arxiv for REAL and ESDG across models, closely overlapping." width="2600" height="423" loading="lazy"><figcaption>Fig. 13 · Accuracy and loss on Arxiv track the ESDG baseline.</figcaption></figure>
+        </div>
+      </div>
+    </div>
+
+    <div class="result-block notes">
+      <div class="two-col">
+        <div class="note">
+          <h4>Scope of reuse</h4>
+          <p>Both reuse types apply at the <b>first GNN layer</b>, where inputs are time-invariant within a group. The GAT variant is exact. The GCN variant omits a second-order re-normalization of unchanged neighbors, which has an empirically negligible effect. Deeper layers are recomputed in full, which is why 2-layer gains are smaller.</p>
+        </div>
+        <div class="note">
+          <h4>Sensitivity to available reuse</h4>
+          <p>Type I savings shrink as edges change faster. Once a <code>dmap</code> stops being sparse, the preprocessor falls back to full <code>GraphConv</code> instead of paying a penalty. Type II doesn't depend on the change rate. <span class="sc">Real</span> therefore degrades gracefully toward a reuse-free but load-balanced scheduler.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PAPER & CITE ================= -->
+  <section class="band" id="cite">
+    <div class="wrap section">
+      <header class="sec-head">
+        <span class="sec-no" aria-hidden="true">05</span>
+        <div>
+          <p class="sec-en">Paper &amp; citation</p>
+          <h2>Read the paper</h2>
+        </div>
+      </header>
+      <div class="paper-row">
+        <a class="paper-thumb" href="static/pdf/REAL_SC26.pdf" aria-label="Open the paper PDF">
+          <img src="static/img/page1.png" alt="First page of the REAL paper" loading="lazy">
+          <img src="static/img/page2.png" alt="" loading="lazy">
+          <img src="static/img/page3.png" alt="" loading="lazy">
+        </a>
+        <div>
+          <p class="paper-title">REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling</p>
+          <p class="paper-meta">Zihao Fan, Yunzhuo Liu, Tian Guo, Bo Jiang · SC ’26</p>
+          <div class="paper-links">
+            <a class="btn btn-red" href="static/pdf/REAL_SC26.pdf">Paper (PDF)</a>
+            <a class="btn" href="https://github.com/JayFzh/REAL">Code &amp; artifact on GitHub</a>
+          </div>
+          <div class="bib">
+            <div class="bib-head"><span>BibTeX</span><button class="copy" id="copy-bib" type="button">Copy</button></div>
+<pre id="bib-text">@inproceedings{fan2026real,
+  title     = {REAL: Efficient Distributed Training of Dynamic GNNs with
+               Reuse-Aware Load Balancing Scheduling},
+  author    = {Fan, Zihao and Liu, Yunzhuo and Guo, Tian and Jiang, Bo},
+  booktitle = {Proceedings of the International Conference for
+               High Performance Computing, Networking, Storage,
+               and Analysis (SC '26)},
+  year      = {2026}
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="hero-pattern" aria-hidden="true"></div>
+  <div class="wrap footer-inner">
+    <a class="footer-logo" href="https://www.sjtu.edu.cn/"><img src="static/img/sjtu-logo-white.png" alt="Shanghai Jiao Tong University" width="679" height="180" loading="lazy"></a>
+    <div class="footer-text">
+      <p><b><span class="sc">Real</span></b> · SC ’26 · Shanghai Jiao Tong University &amp; Worcester Polytechnic Institute</p>
+      <p class="footer-fine">Colors follow the SJTU visual identity (交大红 #C8161E). The SJTU emblem and logotype belong to Shanghai Jiao Tong University. Title set in Cinzel (SIL OFL).</p>
+    </div>
+  </div>
+</footer>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" type="button" aria-label="Close">×</button>
+  <img alt="">
+</div>
+
+</body>
+</html>
