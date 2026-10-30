@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling</title>
+  <meta name="description" content="Dynamic Graph Neural Networks (DGNNs) enable learning from evolving graphs by capturing both structural and temporal dependencies. However, training DGNNs at scale is challenging due to three conflicting requirements: maximizing resource utilization, minimizing data transfers, and maximizing data reuse. Existing systems typically optimize one objective at the expense of the others, leading to communication bottlenecks, load imbalance, or redundant computation. We present REAL, a reuse-aware distributed system for DGNN training that jointly addresses these challenges. REAL minimizes data transfers via snapshot-group scheduling, and leverages an incremental aggregation mechanism to decouple computation from structural updates, effectively pruning redundant I/O and FLOPs via snapshot- and group-level reuse. We further design two complementary schedulers: REAL-L, an ILP-based optimizer for globally optimal planning, and REAL-G, a scalable greedy heuristic. Experiments on six dynamic graph datasets and four DGNN models show that REAL-L and REAL-G achieve 1.11×–3.26× and 1.10×–3.16× speedup over the strongest baseline.">
+  <meta name="citation_title" content="REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling">
+  <meta name="citation_author" content="Zihao Fan">
+  <meta name="citation_author" content="Yunzhuo Liu">
+  <meta name="citation_author" content="Tian Guo">
+  <meta name="citation_author" content="Bo Jiang">
+  <meta name="citation_publication_date" content="2026">
+  <meta name="citation_conference_title" content="International Conference for High Performance Computing, Networking, Storage and Analysis (SC 2026)">
+  <meta name="citation_publisher" content="IEEE">
+  <meta name="citation_pdf_url" content="https://jayfzh.github.io/REAL/static/pdf/REAL_SC26.pdf">
+  <link rel="canonical" href="https://jayfzh.github.io/REAL/paper.html">
+  <link rel="icon" type="image/png" href="static/img/favicon-64.png">
+  <style>
+    :root { color-scheme: light dark; }
+    body { max-width: 980px; margin: 0 auto; padding: 24px; font: 16px/1.6 system-ui, -apple-system, sans-serif; }
+    nav { font-size: 14px; margin-bottom: 24px; }
+    a { color: #a9121a; text-underline-offset: 3px; }
+    h1 { font-size: clamp(24px, 3vw, 32px); line-height: 1.25; margin: 0 0 16px; }
+    h2 { font-size: 22px; margin: 24px 0 8px; }
+    p { margin: 10px 0; }
+    .authors { font-size: 18px; }
+    .venue { color: #514747; }
+    .resources { display: flex; gap: 24px; flex-wrap: wrap; margin: 16px 0 20px; font-weight: 600; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; background: #f5f2f2; font-size: 13px; }
+    footer { margin-top: 24px; font-size: 14px; border-top: 1px solid #ddd; padding-top: 16px; }
+    @media (prefers-color-scheme: dark) { a { color: #ff8f94; } .venue { color: #d0c7c7; } pre { background: #252020; } }
+  </style>
+</head>
+<body>
+  <nav aria-label="Navigation"><a href="https://jayfzh.github.io/">Zihao Fan</a> · <a href="./">REAL project</a></nav>
+  <main>
+    <h1>REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling</h1>
+    <p class="authors">Zihao Fan, Yunzhuo Liu, Tian Guo, Bo Jiang</p>
+    <p>Shanghai Jiao Tong University; Worcester Polytechnic Institute</p>
+    <p class="venue">International Conference for High Performance Computing, Networking, Storage and Analysis (SC 2026) · 2026</p>
+    <p class="resources"><a href="https://jayfzh.github.io/REAL/static/pdf/REAL_SC26.pdf">Read the full paper (PDF)</a><a href="https://github.com/JayFzh/REAL">Code and artifact</a><a href="#citation">BibTeX</a></p>
+    <section aria-labelledby="abstract-heading">
+      <h2 id="abstract-heading">Abstract</h2>
+      <p>Dynamic Graph Neural Networks (DGNNs) enable learning from evolving graphs by capturing both structural and temporal dependencies. However, training DGNNs at scale is challenging due to three conflicting requirements: maximizing resource utilization, minimizing data transfers, and maximizing data reuse. Existing systems typically optimize one objective at the expense of the others, leading to communication bottlenecks, load imbalance, or redundant computation.</p>
+    <p>We present REAL, a reuse-aware distributed system for DGNN training that jointly addresses these challenges. REAL minimizes data transfers via snapshot-group scheduling, and leverages an incremental aggregation mechanism to decouple computation from structural updates, effectively pruning redundant I/O and FLOPs via snapshot- and group-level reuse. We further design two complementary schedulers: REAL-L, an ILP-based optimizer for globally optimal planning, and REAL-G, a scalable greedy heuristic. Experiments on six dynamic graph datasets and four DGNN models show that REAL-L and REAL-G achieve 1.11×–3.26× and 1.10×–3.16× speedup over the strongest baseline.</p>
+    </section>
+    <section aria-labelledby="citation">
+      <h2 id="citation">Citation</h2>
+      <pre>@inproceedings{fan2026real,
+  title = {REAL: Efficient Distributed Training of Dynamic GNNs with Reuse-Aware Load Balancing Scheduling},
+  author = {Fan, Zihao and Liu, Yunzhuo and Guo, Tian and Jiang, Bo},
+  booktitle = {International Conference for High Performance Computing, Networking, Storage and Analysis (SC 2026)},
+  year = {2026},
+  publisher = {IEEE},
+  url = {https://jayfzh.github.io/REAL/paper.html}
+}</pre>
+    </section>
+  </main>
+  <footer><a href="https://jayfzh.github.io/pubs/SC26-Real-DGNN-training.pdf">PDF on the author's homepage</a> · <a href="./">Project overview and results</a></footer>
+</body>
+</html>
